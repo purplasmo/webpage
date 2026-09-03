@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Galactic Ooze</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    inset: 0;
+  }
+</style>
+</head>
+<body>
+<canvas id="ooze"></canvas>
+
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('ooze');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, dpr = 1;
+
+  // ---------- Tunables ----------
+  var BASE_R = 64;        // ball radius at a ~800px viewport (scales with the window)
+  var TURN_RATE = 1.1;    // rad/s steering agility
+  var SPEED_MIN = 110, SPEED_MAX = 230;  // px/s
+  var SQUASH = 0.45;      // how flat it gets when it hits a wall (0..0.6)
+  var STRETCH = 0.10;     // how much it elongates in its direction of travel at full speed
+
+  var R = BASE_R;
+  var body = { x: 0, y: 0, heading: 0, speed: 150, targetSpeed: 150 };
+  var target = { x: 0, y: 0 };
+  var time = 0, last = performance.now();
+
+  // wall-squash spring state
+  var squash = { nx: 1, ny: 0, t: 99, cooldown: 0 };
+  // jelly jiggle: a few surface wobble modes that get excited by impacts and die down
+  var jiggle = { amp: 0, t: 99, phase: 0 };
+
+  var stars = [], galaxies = [], drips = [];
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function wrapAngle(a) { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var s = Math.max(0.55, Math.min(1.4, Math.min(W, H) / 800));
+    R = BASE_R * s;
+    body.x = Math.max(R, Math.min(W - R, body.x));
+    body.y = Math.max(R, Math.min(H - R, body.y));
+  }
+
+  // Aim somewhere. Roughly half the time aim straight past a wall so it swims into it and bounces.
+  function pickTarget() {
+    if (Math.random() < 0.55) {
+      var side = Math.floor(rand(0, 4));
+      if (side === 0) { target.x = -R * 2; target.y = rand(R, H - R); }
+      else if (side === 1) { target.x = W + R * 2; target.y = rand(R, H - R); }
+      else if (side === 2) { target.x = rand(R, W - R); target.y = -R * 2; }
+      else { target.x = rand(R, W - R); target.y = H + R * 2; }
+    } else {
+      target.x = rand(R * 2, W - R * 2);
+      target.y = rand(R * 2, H - R * 2);
+    }
+    body.targetSpeed = rand(SPEED_MIN, SPEED_MAX);
+  }
+
+  function init() {
+    resize();
+    body.x = W * 0.5; body.y = H * 0.5;
+    body.heading = rand(0, Math.PI * 2);
+    pickTarget();
+
+    // stars inside the ball, polar coords relative to its heading
+    for (var s = 0; s < 80; s++) {
+      stars.push({ ang: rand(0, Math.PI * 2), dist: Math.sqrt(Math.random()) * 0.9, size: rand(0.5, 1.9), tw: rand(0, Math.PI * 2), twSpeed: rand(1.5, 4) });
+    }
+    var palette = ['rgba(216,180,254,', 'rgba(240,171,252,', 'rgba(167,139,250,', 'rgba(249,168,212,', 'rgba(196,181,253,', 'rgba(221,214,254,'];
+    for (var g = 0; g < 7; g++) {
+      galaxies.push({
+        ang: rand(0, Math.PI * 2), dist: rand(0.05, 0.62), size: rand(0.28, 0.55),
+        color: palette[g % palette.length],
+        orbit: rand(-0.3, 0.3), spin: rand(-0.8, 0.8), phase: rand(0, Math.PI * 2)
+      });
+    }
+  }
+
+  // Damped spring: 1 = fully squashed, negative = rebounding stretch, settles to 0
+  function squashAmount() {
+    var t = squash.t;
+    if (t > 2.2) return 0;
+    return Math.exp(-t * 3.2) * Math.cos(t * 7.5);
+  }
+
+  // Affine "jelly" transform for any point relative to the ball centre:
+  //   1) slight elongation along the direction of travel
+  //   2) squash against the wall it just hit (with rebound overshoot)
+  function deform(px, py, out) {
+    var rx = px - body.x, ry = py - body.y;
+
+    // motion stretch
+    var sf = Math.max(0, Math.min(1, body.speed / SPEED_MAX));
+    var hx = Math.cos(body.heading), hy = Math.sin(body.heading);
+    var al = rx * hx + ry * hy;
+    var pxp = rx - al * hx, pyp = ry - al * hy;
+    var sa = 1 + STRETCH * sf, sp = 1 - STRETCH * 0.6 * sf;
+    rx = pxp * sp + al * sa * hx;
+    ry = pyp * sp + al * sa * hy;
+
+    // wall squash
+    var amt = squashAmount();
+    var shiftX = 0, shiftY = 0;
+    if (Math.abs(amt) > 0.002) {
+      var nx = squash.nx, ny = squash.ny;
+      al = rx * nx + ry * ny;
+      pxp = rx - al * nx; pyp = ry - al * ny;
+      var qa = 1 - SQUASH * amt, qp = 1 + SQUASH * 0.6 * amt;
+      var shift = -SQUASH * Math.max(0, amt) * R;   // stay pressed against the wall while flattened
+      rx = pxp * qp + (al * qa + shift) * nx;
+      ry = pyp * qp + (al * qa + shift) * ny;
+    }
+
+    out.x = body.x + rx + shiftX;
+    out.y = body.y + ry + shiftY;
+    return out;
+  }
+
+  // Surface radius multiplier at angle th: ambient slow wobble + impact jiggle
+  function surface(th) {
+    var w = 1 + 0.035 * Math.sin(3 * th + time * 2.1) + 0.022 * Math.sin(5 * th - time * 3.3) + 0.012 * Math.sin(7 * th + time * 4.7);
+    if (jiggle.t < 2.5) {
+      var env = jiggle.amp * Math.exp(-jiggle.t * 3.2);
+      w += env * (0.6 * Math.sin(2 * (th - jiggle.phase) ) * Math.cos(jiggle.t * 14) +
+                  0.4 * Math.sin(4 * (th - jiggle.phase) + 0.7) * Math.cos(jiggle.t * 21));
+    }
+    return w;
+  }
+
+  function splash(x, y, nx, ny) {
+    for (var i = 0; i < 6; i++) {
+      var tang = rand(-1, 1);
+      drips.push({
+        x: x, y: y,
+        vx: (-ny * tang) * rand(50, 150) + nx * rand(10, 60),
+        vy: (nx * tang) * rand(50, 150) + ny * rand(10, 60),
+        r: rand(R * 0.04, R * 0.11), life: 1, decay: rand(1.0, 1.8)
+      });
+    }
+  }
+
+  function update(dt) {
+    time += dt;
+    squash.t += dt;
+    jiggle.t += dt;
+    squash.cooldown -= dt;
+
+    // steering
+    var dx = target.x - body.x, dy = target.y - body.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < R * 1.2) pickTarget();
+    var desired = Math.atan2(dy, dx);
+    var diff = wrapAngle(desired - body.heading);
+    body.heading = wrapAngle(body.heading + Math.max(-TURN_RATE * dt, Math.min(TURN_RATE * dt, diff)));
+
+    body.speed += (body.targetSpeed - body.speed) * Math.min(1, dt * 0.8);
+    var stroke = 1 + 0.12 * Math.sin(time * 4.5);          // gentle pulsing propulsion
+    var wobble = Math.sin(time * 4.5) * 0.08;               // slight side-to-side swim
+    var v = body.speed * stroke;
+    body.x += Math.cos(body.heading + wobble) * v * dt;
+    body.y += Math.sin(body.heading + wobble) * v * dt;
+
+    // wall collisions: reflect, squash, jiggle, splash
+    var hitNx = 0, hitNy = 0, hit = false;
+    if (body.x < R) { body.x = R; if (Math.cos(body.heading) < 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = 1; } }
+    if (body.x > W - R) { body.x = W - R; if (Math.cos(body.heading) > 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = -1; } }
+    if (body.y < R) { body.y = R; if (Math.sin(body.heading) < 0) { body.heading = -body.heading; hit = true; hitNy = 1; } }
+    if (body.y > H - R) { body.y = H - R; if (Math.sin(body.heading) > 0) { body.heading = -body.heading; hit = true; hitNy = -1; } }
+    if (hit && squash.cooldown <= 0) {
+      var nl = Math.sqrt(hitNx * hitNx + hitNy * hitNy) || 1;
+      squash.nx = hitNx / nl; squash.ny = hitNy / nl;
+      squash.t = 0;
+      squash.cooldown = 0.4;
+      jiggle.t = 0;
+      jiggle.amp = 0.05 + 0.06 * Math.min(1, body.speed / SPEED_MAX);
+      jiggle.phase = Math.atan2(squash.ny, squash.nx);
+      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);   // little kick off the wall
+      splash(body.x - squash.nx * R, body.y - squash.ny * R, squash.nx, squash.ny);
+      // aim somewhere away from the wall we just hit
+      pickTarget();
+      if ((squash.nx > 0 && target.x < body.x) || (squash.nx < 0 && target.x > body.x) ||
+          (squash.ny > 0 && target.y < body.y) || (squash.ny < 0 && target.y > body.y)) {
+        target.x = W - target.x; target.y = H - target.y;
+      }
+    }
+
+    for (var i = drips.length - 1; i >= 0; i--) {
+      var dr = drips[i];
+      dr.x += dr.vx * dt; dr.y += dr.vy * dt;
+      dr.vx *= 0.97; dr.vy *= 0.97;
+      dr.life -= dr.decay * dt;
+      if (dr.life <= 0) drips.splice(i, 1);
+    }
+    for (i = 0; i < galaxies.length; i++) galaxies[i].ang += galaxies[i].orbit * dt;
+  }
+
+  var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
+
+  function ballPoint(ang, dist, out) {
+    var a = body.heading + ang;
+    return deform(body.x + Math.cos(a) * dist * R, body.y + Math.sin(a) * dist * R, out);
+  }
+
+  function tracePath() {
+    var steps = 72;
+    ctx.beginPath();
+    for (var k = 0; k <= steps; k++) {
+      var th = (k / steps) * Math.PI * 2;
+      var rr = R * surface(th);
+      deform(body.x + Math.cos(th) * rr, body.y + Math.sin(th) * rr, tmp2);
+      if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
+    }
+    ctx.closePath();
+  }
+
+  function drawDrips() {
+    for (var i = 0; i < drips.length; i++) {
+      var d = drips[i];
+      var r = d.r * (0.4 + 0.6 * d.life);
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, d.life * 1.4);
+      ctx.shadowColor = 'rgba(192,38,211,0.8)';
+      ctx.shadowBlur = 14;
+      var g = ctx.createRadialGradient(d.x - r * 0.3, d.y - r * 0.3, r * 0.1, d.x, d.y, r);
+      g.addColorStop(0, '#c084fc'); g.addColorStop(0.6, '#6d28d9'); g.addColorStop(1, '#3b0764');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(d.x, d.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    drawDrips();
+
+    deform(body.x, body.y, tmp2);
+    var cx = tmp2.x, cy = tmp2.y;
+
+    // outer glow + base fill
+    ctx.save();
+    tracePath();
+    ctx.shadowColor = 'rgba(168,85,247,0.55)';
+    ctx.shadowBlur = R * 0.8;
+    ctx.fillStyle = '#3b0a6e';
+    ctx.fill();
+    ctx.restore();
+
+    // interior nebula
+    ctx.save();
+    tracePath();
+    ctx.clip();
+
+    var base = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.3, R * 0.05, cx, cy, R * 1.5);
+    base.addColorStop(0, '#7c3aed');
+    base.addColorStop(0.3, '#5b21b6');
+    base.addColorStop(0.65, '#3b0a6e');
+    base.addColorStop(1, '#1a0538');
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, W, H);
+
+    // darker toward the rim for depth
+    ctx.globalCompositeOperation = 'multiply';
+    var vg = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 1.1);
+    vg.addColorStop(0, 'rgba(255,255,255,1)');
+    vg.addColorStop(1, 'rgba(130,100,185,1)');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    // galaxies
+    ctx.globalCompositeOperation = 'screen';
+    for (var i = 0; i < galaxies.length; i++) {
+      var g = galaxies[i];
+      ballPoint(g.ang, g.dist, tmp);
+      var gr = R * g.size;
+      var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
+      var gg = ctx.createRadialGradient(tmp.x, tmp.y, 0, tmp.x, tmp.y, gr);
+      gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
+      gg.addColorStop(0.25, g.color + (0.45 * pulse) + ')');
+      gg.addColorStop(1, g.color + '0)');
+      ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(tmp.x, tmp.y, gr, 0, Math.PI * 2); ctx.fill();
+
+      ctx.save();
+      ctx.translate(tmp.x, tmp.y);
+      ctx.rotate(time * g.spin + g.phase);
+      ctx.strokeStyle = 'rgba(245,208,254,' + (0.35 * pulse) + ')';
+      ctx.lineWidth = Math.max(0.6, gr * 0.06);
+      ctx.beginPath();
+      for (var arm = 0; arm < 2; arm++) {
+        var a0 = arm * Math.PI;
+        ctx.moveTo(0, 0);
+        for (var s = 0; s <= 1; s += 0.08) {
+          var ang = a0 + s * Math.PI * 1.6, rr = gr * 0.9 * s;
+          ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr * 0.55);
+        }
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // stars
+    ctx.globalCompositeOperation = 'lighter';
+    for (i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      ballPoint(st.ang, st.dist, tmp);
+      var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
+      ctx.fillStyle = 'rgba(255,255,255,' + al + ')';
+      ctx.beginPath(); ctx.arc(tmp.x, tmp.y, st.size, 0, Math.PI * 2); ctx.fill();
+      if (st.size > 1.4) {
+        ctx.fillStyle = 'rgba(233,213,255,' + (al * 0.35) + ')';
+        ctx.beginPath(); ctx.arc(tmp.x, tmp.y, st.size * 2.4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // glossy jelly sheen across the upper-left
+    ctx.globalCompositeOperation = 'screen';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(233,213,255,0.45)';
+    ctx.lineWidth = Math.max(1.5, R * 0.09);
+    ctx.beginPath();
+    for (var k = 0; k <= 16; k++) {
+      var th = -2.7 + (2.0 * k / 16);
+      deform(body.x + Math.cos(th) * R * 0.78, body.y + Math.sin(th) * R * 0.78, tmp2);
+      if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = Math.max(0.8, R * 0.035);
+    ctx.beginPath();
+    for (k = 0; k <= 8; k++) {
+      th = -2.5 + (1.0 * k / 8);
+      deform(body.x + Math.cos(th) * R * 0.85, body.y + Math.sin(th) * R * 0.85, tmp2);
+      if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
+    }
+    ctx.stroke();
+    // small secondary glint lower-right
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = Math.max(0.8, R * 0.03);
+    ctx.beginPath();
+    for (k = 0; k <= 6; k++) {
+      th = 0.5 + (0.6 * k / 6);
+      deform(body.x + Math.cos(th) * R * 0.86, body.y + Math.sin(th) * R * 0.86, tmp2);
+      if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
+    }
+    ctx.stroke();
+
+    // glowing eyes facing the direction of travel
+    ctx.globalCompositeOperation = 'lighter';
+    for (var side = -1; side <= 1; side += 2) {
+      ballPoint(side * 0.45, 0.55, tmp);
+      ctx.save();
+      ctx.translate(tmp.x, tmp.y);
+      ctx.rotate(body.heading + side * 0.5);
+      var eg = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.28);
+      eg.addColorStop(0, 'rgba(255,255,255,0.95)');
+      eg.addColorStop(0.35, 'rgba(240,171,252,0.6)');
+      eg.addColorStop(1, 'rgba(192,38,211,0)');
+      ctx.fillStyle = eg;
+      ctx.beginPath(); ctx.arc(0, 0, R * 0.28, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.ellipse(0, 0, R * 0.14, R * 0.045, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.restore(); // end clip
+
+    // rim glow
+    ctx.save();
+    tracePath();
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(217,70,239,0.9)';
+    ctx.lineWidth = Math.max(1.5, R * 0.04);
+    ctx.shadowColor = 'rgba(217,70,239,0.9)';
+    ctx.shadowBlur = R * 0.4;
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(250,232,255,0.55)';
+    ctx.lineWidth = Math.max(0.8, R * 0.016);
+    ctx.shadowBlur = 0;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', function () { resize(); pickTarget(); });
+
+  init();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
