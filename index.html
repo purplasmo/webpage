@@ -32,24 +32,32 @@
 
   var W = 0, H = 0, dpr = 1;
 
-
-  var BASE_R = 64;     
-  var TURN_RATE = 1.1;    
-  var SPEED_MIN = 110, SPEED_MAX = 230;
-  var SQUASH = 0.45;     
-  var STRETCH = 0.10;    
+  // ---------- Tunables ----------
+  var BASE_R = 64;        // ball radius at a ~800px viewport (scales with the window)
+  var TURN_RATE = 1.1;    // rad/s steering agility
+  var SPEED_MIN = 110, SPEED_MAX = 230;  // px/s
+  var SQUASH = 0.45;      // how flat it gets when it hits a wall (0..0.6)
+  var STRETCH = 0.10;     // how much it elongates in its direction of travel at full speed
 
   var R = BASE_R;
   var body = { x: 0, y: 0, heading: 0, speed: 150, targetSpeed: 150 };
   var target = { x: 0, y: 0 };
   var time = 0, last = performance.now();
 
-
+  // wall-squash spring state
   var squash = { nx: 1, ny: 0, t: 99, cooldown: 0 };
-
+  // jelly jiggle: a few surface wobble modes that get excited by impacts and die down
   var jiggle = { amp: 0, t: 99, phase: 0 };
 
   var stars = [], galaxies = [], drips = [];
+
+  // click-splat state: the ball bursts into gooey pieces, then pulls itself back together
+  var splat = { active: false, t: 0, pieces: [], duration: 1.15 };
+  var SPLAT_PIECES = 8;
+  // offscreen canvases used to render the pieces as one merging goo shape
+  var gooSrc = document.createElement('canvas'), gooRim = document.createElement('canvas'),
+      gooMask = document.createElement('canvas'), gooBody = document.createElement('canvas');
+  var canFilter = (typeof gooSrc.getContext('2d').filter !== 'undefined');
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function wrapAngle(a) { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; }
@@ -68,7 +76,7 @@
     body.y = Math.max(R, Math.min(H - R, body.y));
   }
 
-
+  // Aim somewhere. Roughly half the time aim straight past a wall so it swims into it and bounces.
   function pickTarget() {
     if (Math.random() < 0.55) {
       var side = Math.floor(rand(0, 4));
@@ -89,7 +97,7 @@
     body.heading = rand(0, Math.PI * 2);
     pickTarget();
 
- 
+    // stars inside the ball, polar coords relative to its heading
     for (var s = 0; s < 80; s++) {
       stars.push({ ang: rand(0, Math.PI * 2), dist: Math.sqrt(Math.random()) * 0.9, size: rand(0.5, 1.9), tw: rand(0, Math.PI * 2), twSpeed: rand(1.5, 4) });
     }
@@ -103,18 +111,20 @@
     }
   }
 
-
+  // Damped spring: 1 = fully squashed, negative = rebounding stretch, settles to 0
   function squashAmount() {
     var t = squash.t;
     if (t > 2.2) return 0;
     return Math.exp(-t * 3.2) * Math.cos(t * 7.5);
   }
 
-
+  // Affine "jelly" transform for any point relative to the ball centre:
+  //   1) slight elongation along the direction of travel
+  //   2) squash against the wall it just hit (with rebound overshoot)
   function deform(px, py, out) {
     var rx = px - body.x, ry = py - body.y;
 
- 
+    // motion stretch
     var sf = Math.max(0, Math.min(1, body.speed / SPEED_MAX));
     var hx = Math.cos(body.heading), hy = Math.sin(body.heading);
     var al = rx * hx + ry * hy;
@@ -131,7 +141,7 @@
       al = rx * nx + ry * ny;
       pxp = rx - al * nx; pyp = ry - al * ny;
       var qa = 1 - SQUASH * amt, qp = 1 + SQUASH * 0.6 * amt;
-      var shift = -SQUASH * Math.max(0, amt) * R;
+      var shift = -SQUASH * Math.max(0, amt) * R;   // stay pressed against the wall while flattened
       rx = pxp * qp + (al * qa + shift) * nx;
       ry = pyp * qp + (al * qa + shift) * ny;
     }
@@ -141,7 +151,7 @@
     return out;
   }
 
- 
+  // Surface radius multiplier at angle th: ambient slow wobble + impact jiggle
   function surface(th) {
     var w = 1 + 0.035 * Math.sin(3 * th + time * 2.1) + 0.022 * Math.sin(5 * th - time * 3.3) + 0.012 * Math.sin(7 * th + time * 4.7);
     if (jiggle.t < 2.5) {
@@ -164,13 +174,105 @@
     }
   }
 
+  function insideBall(x, y) {
+    var dx = x - body.x, dy = y - body.y;
+    return dx * dx + dy * dy <= (R * 1.15) * (R * 1.15);
+  }
+
+  function startSplat(cx, cy) {
+    splat.active = true;
+    splat.t = 0;
+    splat.pieces = [];
+    var K = SPLAT_PIECES, baseAng = rand(0, Math.PI * 2);
+    for (var i = 0; i < K; i++) {
+      var ang = baseAng + (i / K) * Math.PI * 2 + rand(-0.25, 0.25);
+      var dx = Math.cos(ang), dy = Math.sin(ang);
+      // push pieces away from where the click landed
+      var sx = body.x + dx * R * 0.4, sy = body.y + dy * R * 0.4;
+      var ax = sx - cx, ay = sy - cy, al = Math.sqrt(ax * ax + ay * ay) || 1;
+      var reach = R * rand(0.95, 1.45);
+      splat.pieces.push({
+        ang: ang,
+        ox: dx * reach + (ax / al) * R * 0.55,
+        oy: dy * reach + (ay / al) * R * 0.55,
+        r: R * rand(0.3, 0.42),
+        wob: rand(0, Math.PI * 2),
+        x: body.x, y: body.y, cr: R * 0.4
+      });
+    }
+    // assign every star, galaxy and eye to the piece flying off in its direction
+    for (i = 0; i < stars.length; i++) stars[i].piece = nearestPiece(stars[i].ang);
+    for (i = 0; i < galaxies.length; i++) galaxies[i].piece = nearestPiece(galaxies[i].ang);
+    // a spray of droplets
+    for (i = 0; i < 14; i++) {
+      var a = rand(0, Math.PI * 2), sp = rand(120, 360);
+      drips.push({ x: cx + Math.cos(a) * R * 0.2, y: cy + Math.sin(a) * R * 0.2, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                   r: rand(R * 0.03, R * 0.1), life: 1, decay: rand(0.9, 1.6) });
+    }
+    body.speed = 0;
+  }
+
+  function nearestPiece(ang) {
+    var a = wrapAngle(body.heading + ang), best = 0, bd = 99;
+    for (var i = 0; i < splat.pieces.length; i++) {
+      var d = Math.abs(wrapAngle(splat.pieces[i].ang - a));
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  function endSplat() {
+    splat.active = false;
+    jiggle.t = 0; jiggle.amp = 0.14; jiggle.phase = rand(0, Math.PI * 2);
+    body.speed = SPEED_MIN * 0.4;   // eases back up to cruising speed
+  }
+
+  // piece spread envelope: fly out fast, hang for a beat, then get pulled back together
+  function splatEnvelope(t) {
+    var out = 1 - Math.exp(-t * 13);
+    var back;
+    if (t < 0.32) back = 1;
+    else { var k = Math.min(1, (t - 0.32) / (splat.duration - 0.32)); back = 1 - k * k * (3 - 2 * k); }
+    return out * back;
+  }
+
+  function pointerPos(e) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    var pt = pointerPos(e);
+    if (!splat.active && insideBall(pt.x, pt.y)) startSplat(pt.x, pt.y);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    var pt = pointerPos(e);
+    canvas.style.cursor = (!splat.active && insideBall(pt.x, pt.y)) ? 'pointer' : 'default';
+  });
+
   function update(dt) {
     time += dt;
     squash.t += dt;
     jiggle.t += dt;
     squash.cooldown -= dt;
 
+    if (splat.active) {
+      splat.t += dt;
+      var env = splatEnvelope(splat.t);
+      var reform = splat.t < 0.32 ? 0 : Math.min(1, (splat.t - 0.32) / (splat.duration - 0.32));
+      for (var pi = 0; pi < splat.pieces.length; pi++) {
+        var pc = splat.pieces[pi];
+        pc.x = body.x + pc.ox * env;
+        pc.y = body.y + pc.oy * env;
+        // pieces swell back toward full size as they merge so the reformed ball is the right size
+        pc.cr = pc.r + (R * 0.92 - pc.r) * Math.pow(reform, 1.6);
+      }
+      if (splat.t >= splat.duration) endSplat();
+      updateDrips(dt);
+      for (pi = 0; pi < galaxies.length; pi++) galaxies[pi].ang += galaxies[pi].orbit * dt;
+      return;
+    }
 
+    // steering
     var dx = target.x - body.x, dy = target.y - body.y;
     var dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < R * 1.2) pickTarget();
@@ -179,13 +281,13 @@
     body.heading = wrapAngle(body.heading + Math.max(-TURN_RATE * dt, Math.min(TURN_RATE * dt, diff)));
 
     body.speed += (body.targetSpeed - body.speed) * Math.min(1, dt * 0.8);
-    var stroke = 1 + 0.12 * Math.sin(time * 4.5);
-    var wobble = Math.sin(time * 4.5) * 0.08;
+    var stroke = 1 + 0.12 * Math.sin(time * 4.5);          // gentle pulsing propulsion
+    var wobble = Math.sin(time * 4.5) * 0.08;               // slight side-to-side swim
     var v = body.speed * stroke;
     body.x += Math.cos(body.heading + wobble) * v * dt;
     body.y += Math.sin(body.heading + wobble) * v * dt;
 
-   
+    // wall collisions: reflect, squash, jiggle, splash
     var hitNx = 0, hitNy = 0, hit = false;
     if (body.x < R) { body.x = R; if (Math.cos(body.heading) < 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = 1; } }
     if (body.x > W - R) { body.x = W - R; if (Math.cos(body.heading) > 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = -1; } }
@@ -199,9 +301,9 @@
       jiggle.t = 0;
       jiggle.amp = 0.05 + 0.06 * Math.min(1, body.speed / SPEED_MAX);
       jiggle.phase = Math.atan2(squash.ny, squash.nx);
-      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);
+      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);   // little kick off the wall
       splash(body.x - squash.nx * R, body.y - squash.ny * R, squash.nx, squash.ny);
-
+      // aim somewhere away from the wall we just hit
       pickTarget();
       if ((squash.nx > 0 && target.x < body.x) || (squash.nx < 0 && target.x > body.x) ||
           (squash.ny > 0 && target.y < body.y) || (squash.ny < 0 && target.y > body.y)) {
@@ -209,6 +311,11 @@
       }
     }
 
+    updateDrips(dt);
+    for (var i = 0; i < galaxies.length; i++) galaxies[i].ang += galaxies[i].orbit * dt;
+  }
+
+  function updateDrips(dt) {
     for (var i = drips.length - 1; i >= 0; i--) {
       var dr = drips[i];
       dr.x += dr.vx * dt; dr.y += dr.vy * dt;
@@ -216,7 +323,6 @@
       dr.life -= dr.decay * dt;
       if (dr.life <= 0) drips.splice(i, 1);
     }
-    for (i = 0; i < galaxies.length; i++) galaxies[i].ang += galaxies[i].orbit * dt;
   }
 
   var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
@@ -257,11 +363,12 @@
   function draw() {
     ctx.clearRect(0, 0, W, H);
     drawDrips();
+    if (splat.active) { drawSplat(); return; }
 
     deform(body.x, body.y, tmp2);
     var cx = tmp2.x, cy = tmp2.y;
 
-
+    // outer glow + base fill
     ctx.save();
     tracePath();
     ctx.shadowColor = 'rgba(168,85,247,0.55)';
@@ -270,7 +377,7 @@
     ctx.fill();
     ctx.restore();
 
-
+    // interior nebula
     ctx.save();
     tracePath();
     ctx.clip();
@@ -283,7 +390,7 @@
     ctx.fillStyle = base;
     ctx.fillRect(0, 0, W, H);
 
-
+    // darker toward the rim for depth
     ctx.globalCompositeOperation = 'multiply';
     var vg = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 1.1);
     vg.addColorStop(0, 'rgba(255,255,255,1)');
@@ -291,7 +398,7 @@
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
 
-
+    // galaxies
     ctx.globalCompositeOperation = 'screen';
     for (var i = 0; i < galaxies.length; i++) {
       var g = galaxies[i];
@@ -323,7 +430,7 @@
       ctx.restore();
     }
 
-
+    // stars
     ctx.globalCompositeOperation = 'lighter';
     for (i = 0; i < stars.length; i++) {
       var st = stars[i];
@@ -337,7 +444,7 @@
       }
     }
 
-
+    // glossy jelly sheen across the upper-left
     ctx.globalCompositeOperation = 'screen';
     ctx.lineCap = 'round';
     ctx.strokeStyle = 'rgba(233,213,255,0.45)';
@@ -358,7 +465,7 @@
       if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
     }
     ctx.stroke();
-
+    // small secondary glint lower-right
     ctx.strokeStyle = 'rgba(255,255,255,0.35)';
     ctx.lineWidth = Math.max(0.8, R * 0.03);
     ctx.beginPath();
@@ -369,7 +476,7 @@
     }
     ctx.stroke();
 
-
+    // glowing eyes facing the direction of travel
     ctx.globalCompositeOperation = 'lighter';
     for (var side = -1; side <= 1; side += 2) {
       ballPoint(side * 0.45, 0.55, tmp);
@@ -387,9 +494,9 @@
       ctx.restore();
     }
 
-    ctx.restore();
+    ctx.restore(); // end clip
 
-
+    // rim glow
     ctx.save();
     tracePath();
     ctx.lineJoin = 'round';
@@ -403,6 +510,136 @@
     ctx.shadowBlur = 0;
     ctx.stroke();
     ctx.restore();
+  }
+
+  // Render the burst pieces as one gooey mass: blur the union of circles, threshold the alpha, use as a mask.
+  function sizeGoo(c, wpx, hpx) {
+    if (c.width !== wpx || c.height !== hpx) { c.width = wpx; c.height = hpx; }
+    return c.getContext('2d');
+  }
+  function smooth(a, b, x) { var k = Math.max(0, Math.min(1, (x - a) / (b - a))); return k * k * (3 - 2 * k); }
+
+  function drawSplat() {
+    var pad = R * 0.6;
+    var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    for (var i = 0; i < splat.pieces.length; i++) {
+      var pc = splat.pieces[i];
+      minX = Math.min(minX, pc.x - pc.cr); maxX = Math.max(maxX, pc.x + pc.cr);
+      minY = Math.min(minY, pc.y - pc.cr); maxY = Math.max(maxY, pc.y + pc.cr);
+    }
+    var ox = Math.floor(minX - pad), oy = Math.floor(minY - pad);
+    var w = Math.ceil(maxX + pad) - ox, h = Math.ceil(maxY + pad) - oy;
+    var wpx = Math.max(1, Math.ceil(w * dpr)), hpx = Math.max(1, Math.ceil(h * dpr));
+
+    // 1) blurred union of the pieces
+    var sc = sizeGoo(gooSrc, wpx, hpx);
+    sc.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
+    sc.clearRect(ox, oy, w, h);
+    if (canFilter) sc.filter = 'blur(' + (R * 0.2) + 'px)';
+    sc.fillStyle = '#000';
+    for (i = 0; i < splat.pieces.length; i++) {
+      pc = splat.pieces[i];
+      sc.beginPath();
+      var steps = 28;
+      for (var k = 0; k <= steps; k++) {
+        var th = (k / steps) * Math.PI * 2;
+        var rr = pc.cr * (1 + 0.09 * Math.sin(3 * th + time * 6 + pc.wob) + 0.05 * Math.sin(5 * th - time * 8));
+        var px = pc.x + Math.cos(th) * rr, py = pc.y + Math.sin(th) * rr;
+        if (k === 0) sc.moveTo(px, py); else sc.lineTo(px, py);
+      }
+      sc.closePath(); sc.fill();
+    }
+    if (canFilter) sc.filter = 'none';
+
+    // 2) threshold the alpha into a body mask and a slightly fatter rim mask
+    var img = sc.getImageData(0, 0, wpx, hpx);
+    var d = img.data, n = d.length;
+    var rimImg = new ImageData(wpx, hpx), rd = rimImg.data;
+    for (i = 3; i < n; i += 4) {
+      var a = d[i];
+      d[i] = Math.round(255 * smooth(112, 148, a));
+      var ra = Math.round(255 * smooth(84, 120, a));
+      rd[i - 3] = 217; rd[i - 2] = 70; rd[i - 1] = 239; rd[i] = ra;
+    }
+    var mc = sizeGoo(gooMask, wpx, hpx); mc.setTransform(1, 0, 0, 1, 0, 0); mc.putImageData(img, 0, 0);
+    var rc = sizeGoo(gooRim, wpx, hpx); rc.setTransform(1, 0, 0, 1, 0, 0); rc.putImageData(rimImg, 0, 0);
+
+    // 3) nebula interior, masked to the goo shape
+    var bc = sizeGoo(gooBody, wpx, hpx);
+    bc.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
+    bc.globalCompositeOperation = 'source-over';
+    bc.clearRect(ox, oy, w, h);
+    bc.fillStyle = '#2a0a52';
+    bc.fillRect(ox, oy, w, h);
+    var reform = splat.t < 0.32 ? 0 : Math.min(1, (splat.t - 0.32) / (splat.duration - 0.32));
+    var starScale = 0.55 + 0.45 * reform, galScale = 0.7 + 0.3 * reform;
+    bc.globalCompositeOperation = 'source-over';
+    for (i = 0; i < splat.pieces.length; i++) {
+      pc = splat.pieces[i];
+      var pg = bc.createRadialGradient(pc.x - pc.cr * 0.3, pc.y - pc.cr * 0.3, pc.cr * 0.05, pc.x, pc.y, pc.cr * 1.1);
+      pg.addColorStop(0, 'rgba(124,58,237,0.9)');
+      pg.addColorStop(0.45, 'rgba(91,33,182,0.5)');
+      pg.addColorStop(1, 'rgba(59,10,110,0)');
+      bc.fillStyle = pg;
+      bc.beginPath(); bc.arc(pc.x, pc.y, pc.cr * 1.1, 0, Math.PI * 2); bc.fill();
+    }
+    // as the pieces merge, fade in the same core glow the whole ball has so the hand-off is seamless
+    if (reform > 0) {
+      var cg = bc.createRadialGradient(body.x - R * 0.3, body.y - R * 0.3, R * 0.05, body.x, body.y, R * 1.2);
+      cg.addColorStop(0, 'rgba(124,58,237,' + (0.95 * reform) + ')');
+      cg.addColorStop(0.35, 'rgba(91,33,182,' + (0.7 * reform) + ')');
+      cg.addColorStop(1, 'rgba(59,10,110,0)');
+      bc.fillStyle = cg;
+      bc.beginPath(); bc.arc(body.x, body.y, R * 1.2, 0, Math.PI * 2); bc.fill();
+    }
+    bc.globalCompositeOperation = 'screen';
+    for (i = 0; i < galaxies.length; i++) {
+      var g = galaxies[i]; pc = splat.pieces[g.piece];
+      var a2 = body.heading + g.ang;
+      var gx = pc.x + Math.cos(a2) * g.dist * R * galScale, gy = pc.y + Math.sin(a2) * g.dist * R * galScale;
+      var gr = R * g.size * 0.8;
+      var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
+      var gg = bc.createRadialGradient(gx, gy, 0, gx, gy, gr);
+      gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
+      gg.addColorStop(0.25, g.color + (0.45 * pulse) + ')');
+      gg.addColorStop(1, g.color + '0)');
+      bc.fillStyle = gg;
+      bc.beginPath(); bc.arc(gx, gy, gr, 0, Math.PI * 2); bc.fill();
+    }
+    bc.globalCompositeOperation = 'lighter';
+    for (i = 0; i < stars.length; i++) {
+      var st = stars[i]; pc = splat.pieces[st.piece];
+      a2 = body.heading + st.ang;
+      var sx = pc.x + Math.cos(a2) * st.dist * R * starScale, sy = pc.y + Math.sin(a2) * st.dist * R * starScale;
+      var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
+      bc.fillStyle = 'rgba(255,255,255,' + al + ')';
+      bc.beginPath(); bc.arc(sx, sy, st.size, 0, Math.PI * 2); bc.fill();
+    }
+    // little sheen on each piece
+    bc.globalCompositeOperation = 'screen';
+    bc.lineCap = 'round';
+    bc.strokeStyle = 'rgba(255,255,255,0.7)';
+    bc.lineWidth = Math.max(0.8, R * 0.03);
+    for (i = 0; i < splat.pieces.length; i++) {
+      pc = splat.pieces[i];
+      bc.beginPath(); bc.arc(pc.x, pc.y, pc.cr * 0.72, -2.4, -1.5); bc.stroke();
+    }
+    bc.globalCompositeOperation = 'destination-in';
+    bc.setTransform(1, 0, 0, 1, 0, 0);
+    bc.drawImage(gooMask, 0, 0);
+
+    // 4) composite: glow, rim, body
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    var dx = ox * dpr, dy = oy * dpr;
+    ctx.shadowColor = 'rgba(168,85,247,0.6)';
+    ctx.shadowBlur = R * 0.7 * dpr;
+    ctx.drawImage(gooRim, dx, dy);
+    ctx.shadowBlur = 0;
+    ctx.drawImage(gooRim, dx, dy);
+    ctx.drawImage(gooBody, dx, dy);
+    ctx.restore();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
   function frame(now) {
