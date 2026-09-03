@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Galactic Ooze</title>
+<title>purplasmo</title>
 <style>
   html, body {
     margin: 0;
@@ -32,21 +32,21 @@
 
   var W = 0, H = 0, dpr = 1;
 
-  // ---------- Tunables ----------
-  var BASE_R = 64;        // ball radius at a ~800px viewport (scales with the window)
-  var TURN_RATE = 1.1;    // rad/s steering agility
-  var SPEED_MIN = 110, SPEED_MAX = 230;  // px/s
-  var SQUASH = 0.45;      // how flat it gets when it hits a wall (0..0.6)
-  var STRETCH = 0.10;     // how much it elongates in its direction of travel at full speed
+
+  var BASE_R = 64;     
+  var TURN_RATE = 1.1;    
+  var SPEED_MIN = 110, SPEED_MAX = 230;
+  var SQUASH = 0.45;     
+  var STRETCH = 0.10;    
 
   var R = BASE_R;
   var body = { x: 0, y: 0, heading: 0, speed: 150, targetSpeed: 150 };
   var target = { x: 0, y: 0 };
   var time = 0, last = performance.now();
 
-  // wall-squash spring state
+
   var squash = { nx: 1, ny: 0, t: 99, cooldown: 0 };
-  // jelly jiggle: a few surface wobble modes that get excited by impacts and die down
+
   var jiggle = { amp: 0, t: 99, phase: 0 };
 
   var stars = [], galaxies = [], drips = [];
@@ -68,7 +68,7 @@
     body.y = Math.max(R, Math.min(H - R, body.y));
   }
 
-  // Aim somewhere. Roughly half the time aim straight past a wall so it swims into it and bounces.
+
   function pickTarget() {
     if (Math.random() < 0.55) {
       var side = Math.floor(rand(0, 4));
@@ -89,7 +89,7 @@
     body.heading = rand(0, Math.PI * 2);
     pickTarget();
 
-    // stars inside the ball, polar coords relative to its heading
+ 
     for (var s = 0; s < 80; s++) {
       stars.push({ ang: rand(0, Math.PI * 2), dist: Math.sqrt(Math.random()) * 0.9, size: rand(0.5, 1.9), tw: rand(0, Math.PI * 2), twSpeed: rand(1.5, 4) });
     }
@@ -103,20 +103,18 @@
     }
   }
 
-  // Damped spring: 1 = fully squashed, negative = rebounding stretch, settles to 0
+
   function squashAmount() {
     var t = squash.t;
     if (t > 2.2) return 0;
     return Math.exp(-t * 3.2) * Math.cos(t * 7.5);
   }
 
-  // Affine "jelly" transform for any point relative to the ball centre:
-  //   1) slight elongation along the direction of travel
-  //   2) squash against the wall it just hit (with rebound overshoot)
+
   function deform(px, py, out) {
     var rx = px - body.x, ry = py - body.y;
 
-    // motion stretch
+ 
     var sf = Math.max(0, Math.min(1, body.speed / SPEED_MAX));
     var hx = Math.cos(body.heading), hy = Math.sin(body.heading);
     var al = rx * hx + ry * hy;
@@ -133,7 +131,7 @@
       al = rx * nx + ry * ny;
       pxp = rx - al * nx; pyp = ry - al * ny;
       var qa = 1 - SQUASH * amt, qp = 1 + SQUASH * 0.6 * amt;
-      var shift = -SQUASH * Math.max(0, amt) * R;   // stay pressed against the wall while flattened
+      var shift = -SQUASH * Math.max(0, amt) * R;
       rx = pxp * qp + (al * qa + shift) * nx;
       ry = pyp * qp + (al * qa + shift) * ny;
     }
@@ -143,7 +141,7 @@
     return out;
   }
 
-  // Surface radius multiplier at angle th: ambient slow wobble + impact jiggle
+ 
   function surface(th) {
     var w = 1 + 0.035 * Math.sin(3 * th + time * 2.1) + 0.022 * Math.sin(5 * th - time * 3.3) + 0.012 * Math.sin(7 * th + time * 4.7);
     if (jiggle.t < 2.5) {
@@ -172,7 +170,7 @@
     jiggle.t += dt;
     squash.cooldown -= dt;
 
-    // steering
+
     var dx = target.x - body.x, dy = target.y - body.y;
     var dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < R * 1.2) pickTarget();
@@ -181,13 +179,13 @@
     body.heading = wrapAngle(body.heading + Math.max(-TURN_RATE * dt, Math.min(TURN_RATE * dt, diff)));
 
     body.speed += (body.targetSpeed - body.speed) * Math.min(1, dt * 0.8);
-    var stroke = 1 + 0.12 * Math.sin(time * 4.5);          // gentle pulsing propulsion
-    var wobble = Math.sin(time * 4.5) * 0.08;               // slight side-to-side swim
+    var stroke = 1 + 0.12 * Math.sin(time * 4.5);
+    var wobble = Math.sin(time * 4.5) * 0.08;
     var v = body.speed * stroke;
     body.x += Math.cos(body.heading + wobble) * v * dt;
     body.y += Math.sin(body.heading + wobble) * v * dt;
 
-    // wall collisions: reflect, squash, jiggle, splash
+   
     var hitNx = 0, hitNy = 0, hit = false;
     if (body.x < R) { body.x = R; if (Math.cos(body.heading) < 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = 1; } }
     if (body.x > W - R) { body.x = W - R; if (Math.cos(body.heading) > 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = -1; } }
@@ -201,9 +199,9 @@
       jiggle.t = 0;
       jiggle.amp = 0.05 + 0.06 * Math.min(1, body.speed / SPEED_MAX);
       jiggle.phase = Math.atan2(squash.ny, squash.nx);
-      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);   // little kick off the wall
+      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);
       splash(body.x - squash.nx * R, body.y - squash.ny * R, squash.nx, squash.ny);
-      // aim somewhere away from the wall we just hit
+
       pickTarget();
       if ((squash.nx > 0 && target.x < body.x) || (squash.nx < 0 && target.x > body.x) ||
           (squash.ny > 0 && target.y < body.y) || (squash.ny < 0 && target.y > body.y)) {
@@ -263,7 +261,7 @@
     deform(body.x, body.y, tmp2);
     var cx = tmp2.x, cy = tmp2.y;
 
-    // outer glow + base fill
+
     ctx.save();
     tracePath();
     ctx.shadowColor = 'rgba(168,85,247,0.55)';
@@ -272,7 +270,7 @@
     ctx.fill();
     ctx.restore();
 
-    // interior nebula
+
     ctx.save();
     tracePath();
     ctx.clip();
@@ -285,7 +283,7 @@
     ctx.fillStyle = base;
     ctx.fillRect(0, 0, W, H);
 
-    // darker toward the rim for depth
+
     ctx.globalCompositeOperation = 'multiply';
     var vg = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 1.1);
     vg.addColorStop(0, 'rgba(255,255,255,1)');
@@ -293,7 +291,7 @@
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
 
-    // galaxies
+
     ctx.globalCompositeOperation = 'screen';
     for (var i = 0; i < galaxies.length; i++) {
       var g = galaxies[i];
@@ -325,7 +323,7 @@
       ctx.restore();
     }
 
-    // stars
+
     ctx.globalCompositeOperation = 'lighter';
     for (i = 0; i < stars.length; i++) {
       var st = stars[i];
@@ -339,7 +337,7 @@
       }
     }
 
-    // glossy jelly sheen across the upper-left
+
     ctx.globalCompositeOperation = 'screen';
     ctx.lineCap = 'round';
     ctx.strokeStyle = 'rgba(233,213,255,0.45)';
@@ -360,7 +358,7 @@
       if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
     }
     ctx.stroke();
-    // small secondary glint lower-right
+
     ctx.strokeStyle = 'rgba(255,255,255,0.35)';
     ctx.lineWidth = Math.max(0.8, R * 0.03);
     ctx.beginPath();
@@ -371,7 +369,7 @@
     }
     ctx.stroke();
 
-    // glowing eyes facing the direction of travel
+
     ctx.globalCompositeOperation = 'lighter';
     for (var side = -1; side <= 1; side += 2) {
       ballPoint(side * 0.45, 0.55, tmp);
@@ -389,9 +387,9 @@
       ctx.restore();
     }
 
-    ctx.restore(); // end clip
+    ctx.restore();
 
-    // rim glow
+
     ctx.save();
     tracePath();
     ctx.lineJoin = 'round';
