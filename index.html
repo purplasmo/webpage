@@ -487,23 +487,6 @@
     ctx.stroke();
 
 
-    ctx.globalCompositeOperation = 'lighter';
-    for (var side = -1; side <= 1; side += 2) {
-      ballPoint(side * 0.45, 0.55, tmp);
-      ctx.save();
-      ctx.translate(tmp.x, tmp.y);
-      ctx.rotate(body.heading + side * 0.5);
-      var eg = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.28);
-      eg.addColorStop(0, 'rgba(255,255,255,0.95)');
-      eg.addColorStop(0.35, 'rgba(240,171,252,0.6)');
-      eg.addColorStop(1, 'rgba(192,38,211,0)');
-      ctx.fillStyle = eg;
-      ctx.beginPath(); ctx.arc(0, 0, R * 0.28, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.ellipse(0, 0, R * 0.14, R * 0.045, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    }
-
     ctx.restore();
 
 
