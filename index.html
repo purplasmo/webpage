@@ -27,10 +27,24 @@
     position: fixed;
     inset: 0;
   }
+  #tiltdebug {
+    display: none;
+    position: fixed;
+    left: 8px;
+    top: 8px;
+    padding: 6px 8px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    font: 11px/1.4 monospace;
+    white-space: pre;
+    pointer-events: none;
+    z-index: 2;
+  }
 </style>
 </head>
 <body>
 <canvas id="ooze"></canvas>
+<div id="tiltdebug"></div>
 
 <script>
 (function () {
@@ -56,6 +70,7 @@
   var PULL_ACCEL = 2600;       // px/s^2 of magnetic pull at point-blank range
   var PULL_MAX = 520;          // cap on pull speed (px/s)
   var TUG_STRETCH = 0.55;      // how much a pulled fragment elongates toward the primary
+  var FRAG_MERGE_GRACE = 0.8;  // seconds after release before fragments can combine with each other
   var FRAG_SPEED_MIN = 35, FRAG_SPEED_MAX = 90;
   var FRAG_WANDER = 0.7;       // how much fragments meander (rad/s of heading noise)
   var HUNT_CHANCE = 0.6;       // chance the primary blob chases a fragment when it picks a new target
@@ -108,8 +123,9 @@
       phase: rand(0, Math.PI * 2), wob: rand(0, Math.PI * 2),
       stars: [], galaxies: [],
       pvx: 0, pvy: 0,                 // magnetic pull velocity
-      tug: 0, tugX: 1, tugY: 0,       // stretch toward the primary (0..1, unit direction)
-      state: 'free', mt: 0, mk: 0
+      tug: 0, tugX: 1, tugY: 0,       // stretch toward whatever is pulling it (0..1, unit direction)
+      state: 'free', mt: 0, mk: 0,
+      age: 0, host: null, gain: 0     // host: fragment this one is combining into; gain: area flowing in this frame
     };
   }
 
@@ -336,12 +352,14 @@
       var f = frags[i];
       if (f.state !== 'burst') continue;
       f.state = 'free';
+      f.age = 0;
       f.jiggle.t = 0; f.jiggle.amp = 0.1; f.jiggle.phase = f.heading;
     }
   }
 
   // ---- absorbing ----
   function startMerge(f) {
+    finalizeChildren(f);
     f.state = 'merging';
     f.mt = 0; f.mk = 0;
     f.sx = f.x; f.sy = f.y;
@@ -376,6 +394,64 @@
     if (typeof gtag === 'function') gtag('event', 'blob_absorb', { remaining: frags.length });
   }
 
+  // ---- fragments combining with each other ----
+  function transferContents(from, to, entryAng) {
+    var rel = wrapAngle(entryAng - to.heading), i;
+    for (i = 0; i < from.stars.length; i++) {
+      from.stars[i].ang = wrapAngle(rel + rand(-0.7, 0.7));
+      to.stars.push(from.stars[i]);
+    }
+    for (i = 0; i < from.galaxies.length; i++) {
+      from.galaxies[i].ang = wrapAngle(rel + rand(-0.7, 0.7));
+      to.galaxies.push(from.galaxies[i]);
+    }
+    from.stars = []; from.galaxies = [];
+  }
+
+  function startFragMerge(f, host) {
+    finalizeChildren(f);                 // anything still flowing into the smaller one goes with it
+    var af = f.rf * f.rf, ah = host.rf * host.rf;
+    // conserve momentum
+    var vx = (Math.cos(host.heading) * host.speed * ah + Math.cos(f.heading) * f.speed * af) / (ah + af);
+    var vy = (Math.sin(host.heading) * host.speed * ah + Math.sin(f.heading) * f.speed * af) / (ah + af);
+    host.speed = Math.sqrt(vx * vx + vy * vy);
+    if (host.speed > 1) host.heading = Math.atan2(vy, vx);
+    host.pvx = (host.pvx * ah + f.pvx * af) / (ah + af);
+    host.pvy = (host.pvy * ah + f.pvy * af) / (ah + af);
+
+    f.state = 'fmerging';
+    f.host = host;
+    f.mt = 0; f.mk = 0;
+    f.sx = f.x; f.sy = f.y;
+    var dx = f.x - host.x, dy = f.y - host.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = dx / d, ny = dy / d;
+    f.entryAng = Math.atan2(dy, dx);
+    f.tug = 1; f.tugX = -nx; f.tugY = -ny;
+    splash(host.x + nx * host.r, host.y + ny * host.r, nx, ny, Math.max(host.r, f.r) * 0.6);
+    host.jiggle.t = 0;
+    host.jiggle.amp = Math.min(0.16, 0.05 + 0.08 * Math.sqrt(af / ah));
+    host.jiggle.phase = f.entryAng;
+  }
+
+  function finishFragMerge(f) {
+    var host = f.host;
+    var idx = frags.indexOf(f);
+    if (idx >= 0) frags.splice(idx, 1);
+    if (!host) return;
+    host.rf = Math.sqrt(host.rf * host.rf + f.rf * f.rf);
+    host.r = R * host.rf;
+    transferContents(f, host, f.entryAng);
+    host.jiggle.t = 0; host.jiggle.amp = 0.09; host.jiggle.phase = f.entryAng;
+    f.host = null;
+    if (typeof gtag === 'function') gtag('event', 'blob_combine', { remaining: frags.length });
+  }
+
+  function finalizeChildren(host) {
+    for (var i = frags.length - 1; i >= 0; i--) {
+      if (frags[i].state === 'fmerging' && frags[i].host === host) finishFragMerge(frags[i]);
+    }
+  }
+
   function finalizeMerges() {
     for (var i = frags.length - 1; i >= 0; i--) {
       if (frags[i].state === 'merging') finishMerge(frags[i]);
@@ -389,7 +465,6 @@
   }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
-    requestTilt();
     var pt = pointerPos(e);
     if (splat.active || !insideBall(body, pt.x, pt.y)) return;
     if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
@@ -409,6 +484,8 @@
   }
 
   function onOrientation(e) {
+    tiltStatus.events++;
+    if (tiltDebug && (tiltStatus.events % 10 === 1)) updateTiltDebug();
     if (e.beta === null || e.gamma === null || e.beta === undefined) return;
     // gamma: right edge down -> positive; beta: top edge raised -> positive (marble rolls toward the bottom)
     var gx = Math.sin(Math.max(-90, Math.min(90, e.gamma)) * Math.PI / 180);
@@ -424,22 +501,64 @@
     }
   }
 
-  var tiltRequested = false;
+  // --- permission plumbing (iOS 13+ needs an explicit, gesture-triggered request over https) ---
+  var tiltDebug = /[?&]tiltdebug/.test(location.search) ? document.getElementById('tiltdebug') : null;
+  var tiltStatus = { perm: 'not requested', events: 0, err: '' };
+  if (tiltDebug) tiltDebug.style.display = 'block';
+
+  function updateTiltDebug() {
+    if (!tiltDebug) return;
+    tiltDebug.textContent =
+      'secure: ' + (window.isSecureContext ? 'yes' : 'NO (sensors need https)') + '\n' +
+      'DeviceOrientationEvent: ' + (typeof DeviceOrientationEvent !== 'undefined' ? 'yes' : 'no') + '\n' +
+      'requestPermission: ' + (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function' ? 'yes' : 'no') + '\n' +
+      'permission: ' + tiltStatus.perm + (tiltStatus.err ? ' (' + tiltStatus.err + ')' : '') + '\n' +
+      'events: ' + tiltStatus.events + '  enabled: ' + tilt.enabled + '\n' +
+      'tilt x: ' + tilt.rawX.toFixed(2) + '  y: ' + tilt.rawY.toFixed(2) + '  angle: ' + screenAngle();
+  }
+
+  var tiltGranted = false, tiltPending = false;
   function requestTilt() {
-    if (tiltRequested) return;
-    tiltRequested = true;
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      // iOS 13+: must be called from a user gesture, and only works over https
-      DeviceOrientationEvent.requestPermission().then(function (state) {
-        if (state === 'granted') window.addEventListener('deviceorientation', onOrientation);
-      }).catch(function () {});
-    }
+    if (tiltGranted || tiltPending) return;
+    if (typeof DeviceOrientationEvent === 'undefined' || typeof DeviceOrientationEvent.requestPermission !== 'function') return;
+    tiltPending = true;
+    tiltStatus.perm = 'requesting';
+    var p;
+    try { p = DeviceOrientationEvent.requestPermission(); }
+    catch (e) { tiltPending = false; tiltStatus.perm = 'threw'; tiltStatus.err = String(e); updateTiltDebug(); return; }
+    p.then(function (state) {
+      tiltPending = false;
+      tiltStatus.perm = state; tiltStatus.err = '';
+      if (state === 'granted') {
+        tiltGranted = true;
+        window.addEventListener('deviceorientation', onOrientation);
+      }
+      updateTiltDebug();
+    }).catch(function (e) {
+      // rejected when not called from a real user gesture; the next tap tries again
+      tiltPending = false;
+      tiltStatus.perm = 'rejected';
+      tiltStatus.err = e && e.name ? e.name : String(e);
+      updateTiltDebug();
+    });
   }
 
   if (typeof DeviceOrientationEvent !== 'undefined') {
-    // Android and older iOS fire without asking; iOS 13+ needs the tap above
-    window.addEventListener('deviceorientation', onOrientation);
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iOS: Safari only honours the request from a gesture it recognises as user activation,
+      // so listen on several gesture types and keep retrying until granted
+      window.addEventListener('touchend', requestTilt, { passive: true });
+      window.addEventListener('click', requestTilt);
+      window.addEventListener('pointerup', requestTilt);
+    } else {
+      // Android and everything else: events just arrive
+      tiltStatus.perm = 'not needed';
+      window.addEventListener('deviceorientation', onOrientation);
+    }
+  } else {
+    tiltStatus.perm = 'unsupported';
   }
+  updateTiltDebug();
 
   function moveMarble(dt) {
     tilt.x += (tilt.rawX - tilt.x) * Math.min(1, dt * TILT_SMOOTH);
@@ -482,6 +601,7 @@
 
   // ---- simulation ----
   function tick(b, dt) {
+    b.age += dt;
     b.squash.t += dt;
     b.jiggle.t += dt;
     b.squash.cooldown -= dt;
@@ -539,9 +659,30 @@
   }
 
   function updateFrags(dt) {
-    for (var i = frags.length - 1; i >= 0; i--) {
-      var f = frags[i];
+    var i, f;
+    for (i = 0; i < frags.length; i++) frags[i].gain = 0;
+
+    for (i = frags.length - 1; i >= 0; i--) {
+      f = frags[i];
       if (f.state === 'burst') continue;
+
+      if (f.state === 'fmerging') {
+        var h = f.host;
+        if (!h || frags.indexOf(h) < 0) { finishFragMerge(f); continue; }
+        f.mt += dt;
+        var kk = smooth01(f.mt / MERGE_TIME);
+        f.mk = smooth(0.15, 1, kk);
+        h.gain += f.rf * f.rf * f.mk;
+        var hx = Math.cos(f.entryAng), hy = Math.sin(f.entryAng);
+        var hr = R * Math.sqrt(h.rf * h.rf + h.gain);
+        var htx = h.x + hx * hr * 0.35, hty = h.y + hy * hr * 0.35;
+        f.x = f.sx + (htx - f.sx) * kk;
+        f.y = f.sy + (hty - f.sy) * kk;
+        f.r = R * f.rf * (1 - 0.95 * smooth(0.45, 1, kk));
+        f.tug = 1 - 0.6 * kk; f.tugX = -hx; f.tugY = -hy;
+        if (f.mt >= MERGE_TIME) finishFragMerge(f);
+        continue;
+      }
 
       var dx = body.x - f.x, dy = body.y - f.y;
       var dist = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -591,6 +732,26 @@
         var touch = body.r + f.r * 1.3;
         if (dx * dx + dy * dy < touch * touch) startMerge(f);
       }
+    }
+
+    // fragments that bump into each other combine (bigger one absorbs the smaller)
+    for (i = 0; i < frags.length; i++) {
+      var a = frags[i];
+      if (a.state !== 'free' || a.age < FRAG_MERGE_GRACE) continue;
+      for (var j = i + 1; j < frags.length; j++) {
+        var b = frags[j];
+        if (b.state !== 'free' || b.age < FRAG_MERGE_GRACE) continue;
+        var ddx = a.x - b.x, ddy = a.y - b.y, reach = (a.r + b.r) * 0.85;
+        if (ddx * ddx + ddy * ddy < reach * reach) {
+          if (a.rf >= b.rf) startFragMerge(b, a); else { startFragMerge(a, b); break; }
+        }
+      }
+    }
+
+    // hosts swell as their children flow in
+    for (i = 0; i < frags.length; i++) {
+      f = frags[i];
+      if (f.state === 'free' && f.gain > 0) f.r = R * Math.sqrt(f.rf * f.rf + f.gain);
     }
   }
 
@@ -817,13 +978,8 @@
 
   // gooey metaball pass: the primary plus any pieces tearing off or sinking in are
   // rendered as one merged surface so necks form and close between them
-  function drawGoo() {
-    var items = [body], i, pc;
-    for (i = 0; i < frags.length; i++) {
-      if (frags[i].state === 'burst' || frags[i].state === 'merging') items.push(frags[i]);
-    }
-
-    var gR = splat.active ? splat.gooR : body.r, pad = gR * 0.6;
+  function drawGoo(items, gR) {
+    var i, pc, pad = gR * 0.6;
     var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
     for (i = 0; i < items.length; i++) {
       pc = items[i];
@@ -957,12 +1113,26 @@
   function draw() {
     ctx.clearRect(0, 0, W, H);
     drawDrips();
-    var goo = splat.active, i;
+    var i, f;
+
+    // fragments: free ones drawn directly, hosts drawn gooey together with what is flowing into them
     for (i = 0; i < frags.length; i++) {
-      if (frags[i].state === 'merging') goo = true;
-      else if (frags[i].state === 'free') drawBlob(frags[i]);   // drifting fragments sit behind the primary
+      f = frags[i];
+      if (f.state !== 'free') continue;
+      var group = null;
+      for (var j = 0; j < frags.length; j++) {
+        if (frags[j].state === 'fmerging' && frags[j].host === f) { if (!group) group = [f]; group.push(frags[j]); }
+      }
+      if (group) drawGoo(group, f.r); else drawBlob(f);
     }
-    if (goo) drawGoo(); else drawBlob(body);
+
+    // primary: gooey while pieces tear off or sink in
+    var items = [body];
+    for (i = 0; i < frags.length; i++) {
+      f = frags[i];
+      if (f.state === 'burst' || f.state === 'merging') items.push(f);
+    }
+    if (items.length > 1) drawGoo(items, splat.active ? splat.gooR : body.r); else drawBlob(body);
   }
 
   function frame(now) {
