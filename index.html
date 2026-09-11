@@ -246,10 +246,13 @@
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
   var splatCount = 0;
+  var splatSound = new Audio('splat.mp3');
   canvas.addEventListener('pointerdown', function (e) {
     var pt = pointerPos(e);
     if (!splat.active && insideBall(pt.x, pt.y)) {
       startSplat(pt.x, pt.y);
+      splatSound.currentTime = 0;
+      splatSound.play().catch(function () {});
       splatCount++;
       if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount });
     }
