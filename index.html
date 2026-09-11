@@ -247,7 +247,10 @@
   }
   canvas.addEventListener('pointerdown', function (e) {
     var pt = pointerPos(e);
-    if (!splat.active && insideBall(pt.x, pt.y)) startSplat(pt.x, pt.y);
+    if (!splat.active && insideBall(pt.x, pt.y)) {
+      startSplat(pt.x, pt.y);
+      if (typeof gtag === 'function') gtag('event', 'blob_splat');
+    }
   });
   canvas.addEventListener('pointermove', function (e) {
     var pt = pointerPos(e);
