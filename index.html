@@ -75,6 +75,7 @@
   var FRAG_WANDER = 0.7;       // how much fragments meander (rad/s of heading noise)
   var HUNT_CHANCE = 0.6;       // chance the primary blob chases a fragment when it picks a new target
   var SOUND_SRC = 'splat.mp3';
+  var COMPLETE_SOUND_SRC = 'purplasmo.mp3';   // plays when the last fragment is absorbed
 
   // marble mode (phones/tablets with a motion sensor)
   var MARBLE_ACCEL = 1900;     // px/s^2 at a full 90 degree tilt
@@ -105,8 +106,9 @@
 
   var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
 
-  var splatSound = null;
+  var splatSound = null, completeSound = null;
   try { splatSound = new Audio(SOUND_SRC); splatSound.preload = 'auto'; } catch (e) { splatSound = null; }
+  try { completeSound = new Audio(COMPLETE_SOUND_SRC); completeSound.preload = 'auto'; } catch (e) { completeSound = null; }
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
@@ -134,6 +136,15 @@
     try {
       var s = splatSound.cloneNode();       // clone so rapid re-splats can overlap
       var p = s.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
+  function playComplete() {
+    if (!completeSound) return;
+    try {
+      completeSound.currentTime = 0;
+      var p = completeSound.play();
       if (p && p.catch) p.catch(function () {});
     } catch (e) {}
   }
@@ -392,6 +403,12 @@
     // swallow ripple
     body.jiggle.t = 0; body.jiggle.amp = 0.09; body.jiggle.phase = f.entryAng;
     if (typeof gtag === 'function') gtag('event', 'blob_absorb', { remaining: frags.length });
+    if (!frags.length) {
+      // whole again
+      body.jiggle.amp = 0.14;
+      playComplete();
+      if (typeof gtag === 'function') gtag('event', 'blob_complete');
+    }
   }
 
   // ---- fragments combining with each other ----
@@ -1150,4 +1167,4 @@
 })();
 </script>
 </body>
-</html>
+</html
