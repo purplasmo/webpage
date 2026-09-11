@@ -41,35 +41,74 @@
 
   var W = 0, H = 0, dpr = 1;
 
-  // set vars
-  var BASE_R = 64;        
-  var TURN_RATE = 1.1;    
+  // ---- tunables ----
+  var BASE_R = 64;
+  var TURN_RATE = 1.1;
   var SPEED_MIN = 110, SPEED_MAX = 230;
-  var SQUASH = 0.45;      
-  var STRETCH = 0.10;     
+  var SQUASH = 0.45;
+  var STRETCH = 0.10;
 
-  var R = BASE_R;
-  var body = { x: 0, y: 0, heading: 0, speed: 150, targetSpeed: 150 };
-  var target = { x: 0, y: 0 };
+  var MAX_PIECES = 8;          // hard cap on fragments in play; a click releases only what has been re-absorbed
+  var KEEP_AREA = 0.30;        // fixed "core" area (fraction of full size) the primary always keeps
+  var BURST_TIME = 0.5;        // seconds of gooey separation before fragments drift freely
+  var MERGE_TIME = 0.35;       // seconds for a fragment to be absorbed
+  var FRAG_SPEED_MIN = 35, FRAG_SPEED_MAX = 90;
+  var FRAG_WANDER = 0.7;       // how much fragments meander (rad/s of heading noise)
+  var HUNT_CHANCE = 0.6;       // chance the primary blob chases a fragment when it picks a new target
+  var SOUND_SRC = 'splat.mp3';
+
+  var R = BASE_R;              // full-size radius (screen scaled); every blob stores rf = radius / R
   var time = 0, last = performance.now();
+  var target = { x: 0, y: 0, frag: null };  // frag: fragment being chased, if any
+  var drips = [], frags = [];
 
+  var body = makeBlob(1);
+  body.rfBase = 1;             // radius factor with no absorption in progress
+  body.speed = 150; body.targetSpeed = 150;
 
-  var squash = { nx: 1, ny: 0, t: 99, cooldown: 0 };
- 
-  var jiggle = { amp: 0, t: 99, phase: 0 };
-
-  var stars = [], galaxies = [], drips = [];
-
- 
-  var splat = { active: false, t: 0, pieces: [], duration: 1.15 };
-  var SPLAT_PIECES = 8;
+  var splat = { active: false, t: 0, rfFrom: 1, rfTo: 1, gooR: BASE_R };
 
   var gooSrc = document.createElement('canvas'), gooRim = document.createElement('canvas'),
       gooMask = document.createElement('canvas'), gooBody = document.createElement('canvas');
   var canFilter = (typeof gooSrc.getContext('2d').filter !== 'undefined');
 
+  var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
+
+  var splatSound = null;
+  try { splatSound = new Audio(SOUND_SRC); splatSound.preload = 'auto'; } catch (e) { splatSound = null; }
+
   function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
   function wrapAngle(a) { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; }
+  function smooth(a, b, x) { var k = Math.max(0, Math.min(1, (x - a) / (b - a))); return k * k * (3 - 2 * k); }
+  function smooth01(x) { return smooth(0, 1, x); }
+
+  function makeBlob(rf) {
+    return {
+      x: 0, y: 0, rf: rf, r: R * rf,
+      heading: rand(0, Math.PI * 2), speed: 0, targetSpeed: 0,
+      squash: { nx: 1, ny: 0, t: 99, cooldown: 0 },
+      jiggle: { amp: 0, t: 99, phase: 0 },
+      phase: rand(0, Math.PI * 2), wob: rand(0, Math.PI * 2),
+      stars: [], galaxies: [],
+      state: 'free', mt: 0, mk: 0
+    };
+  }
+
+  function playSplat() {
+    if (!splatSound) return;
+    try {
+      var s = splatSound.cloneNode();       // clone so rapid re-splats can overlap
+      var p = s.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
+  function syncRadius(b) { b.r = R * b.rf; }
+  function clampInside(b) {
+    b.x = clamp(b.x, b.r, W - b.r);
+    b.y = clamp(b.y, b.r, H - b.r);
+  }
 
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -81,13 +120,16 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     var s = Math.max(0.55, Math.min(1.4, Math.min(W, H) / 800));
     R = BASE_R * s;
-    body.x = Math.max(R, Math.min(W - R, body.x));
-    body.y = Math.max(R, Math.min(H - R, body.y));
+    syncRadius(body); clampInside(body);
+    for (var i = 0; i < frags.length; i++) { syncRadius(frags[i]); clampInside(frags[i]); }
   }
 
-
   function pickTarget() {
-    if (Math.random() < 0.55) {
+    target.frag = null;
+    if (frags.length && Math.random() < HUNT_CHANCE) {
+      var f = frags[Math.floor(Math.random() * frags.length)];
+      target.x = f.x; target.y = f.y; target.frag = f;
+    } else if (Math.random() < 0.55) {
       var side = Math.floor(rand(0, 4));
       if (side === 0) { target.x = -R * 2; target.y = rand(R, H - R); }
       else if (side === 1) { target.x = W + R * 2; target.y = rand(R, H - R); }
@@ -106,13 +148,12 @@
     body.heading = rand(0, Math.PI * 2);
     pickTarget();
 
-   
     for (var s = 0; s < 80; s++) {
-      stars.push({ ang: rand(0, Math.PI * 2), dist: Math.sqrt(Math.random()) * 0.9, size: rand(0.5, 1.9), tw: rand(0, Math.PI * 2), twSpeed: rand(1.5, 4) });
+      body.stars.push({ ang: rand(0, Math.PI * 2), dist: Math.sqrt(Math.random()) * 0.9, size: rand(0.5, 1.9), tw: rand(0, Math.PI * 2), twSpeed: rand(1.5, 4) });
     }
     var palette = ['rgba(216,180,254,', 'rgba(240,171,252,', 'rgba(167,139,250,', 'rgba(249,168,212,', 'rgba(196,181,253,', 'rgba(221,214,254,'];
     for (var g = 0; g < 7; g++) {
-      galaxies.push({
+      body.galaxies.push({
         ang: rand(0, Math.PI * 2), dist: rand(0.05, 0.62), size: rand(0.28, 0.55),
         color: palette[g % palette.length],
         orbit: rand(-0.3, 0.3), spin: rand(-0.8, 0.8), phase: rand(0, Math.PI * 2)
@@ -120,19 +161,19 @@
     }
   }
 
-
-  function squashAmount() {
-    var t = squash.t;
+  // ---- shape ----
+  function squashAmount(sq) {
+    var t = sq.t;
     if (t > 2.2) return 0;
     return Math.exp(-t * 3.2) * Math.cos(t * 7.5);
   }
 
-  function deform(px, py, out) {
-    var rx = px - body.x, ry = py - body.y;
+  function deform(b, px, py, out) {
+    var rx = px - b.x, ry = py - b.y;
 
     // motion stretch
-    var sf = Math.max(0, Math.min(1, body.speed / SPEED_MAX));
-    var hx = Math.cos(body.heading), hy = Math.sin(body.heading);
+    var sf = Math.max(0, Math.min(1, b.speed / SPEED_MAX));
+    var hx = Math.cos(b.heading), hy = Math.sin(b.heading);
     var al = rx * hx + ry * hy;
     var pxp = rx - al * hx, pyp = ry - al * hy;
     var sa = 1 + STRETCH * sf, sp = 1 - STRETCH * 0.6 * sf;
@@ -140,192 +181,328 @@
     ry = pyp * sp + al * sa * hy;
 
     // wall squash
-    var amt = squashAmount();
-    var shiftX = 0, shiftY = 0;
+    var amt = squashAmount(b.squash);
     if (Math.abs(amt) > 0.002) {
-      var nx = squash.nx, ny = squash.ny;
+      var nx = b.squash.nx, ny = b.squash.ny;
       al = rx * nx + ry * ny;
       pxp = rx - al * nx; pyp = ry - al * ny;
       var qa = 1 - SQUASH * amt, qp = 1 + SQUASH * 0.6 * amt;
-      var shift = -SQUASH * Math.max(0, amt) * R;
+      var shift = -SQUASH * Math.max(0, amt) * b.r;
       rx = pxp * qp + (al * qa + shift) * nx;
       ry = pyp * qp + (al * qa + shift) * ny;
     }
 
-    out.x = body.x + rx + shiftX;
-    out.y = body.y + ry + shiftY;
+    out.x = b.x + rx;
+    out.y = b.y + ry;
     return out;
   }
 
-  function surface(th) {
-    var w = 1 + 0.035 * Math.sin(3 * th + time * 2.1) + 0.022 * Math.sin(5 * th - time * 3.3) + 0.012 * Math.sin(7 * th + time * 4.7);
-    if (jiggle.t < 2.5) {
-      var env = jiggle.amp * Math.exp(-jiggle.t * 3.2);
-      w += env * (0.6 * Math.sin(2 * (th - jiggle.phase) ) * Math.cos(jiggle.t * 14) +
-                  0.4 * Math.sin(4 * (th - jiggle.phase) + 0.7) * Math.cos(jiggle.t * 21));
+  function surface(b, th) {
+    var w = 1 + 0.035 * Math.sin(3 * th + time * 2.1 + b.phase) + 0.022 * Math.sin(5 * th - time * 3.3 + b.phase) + 0.012 * Math.sin(7 * th + time * 4.7);
+    var jg = b.jiggle;
+    if (jg.t < 2.5) {
+      var env = jg.amp * Math.exp(-jg.t * 3.2);
+      w += env * (0.6 * Math.sin(2 * (th - jg.phase)) * Math.cos(jg.t * 14) +
+                  0.4 * Math.sin(4 * (th - jg.phase) + 0.7) * Math.cos(jg.t * 21));
     }
     return w;
   }
 
-  function splash(x, y, nx, ny) {
+  function splash(x, y, nx, ny, r) {
     for (var i = 0; i < 6; i++) {
       var tang = rand(-1, 1);
       drips.push({
         x: x, y: y,
         vx: (-ny * tang) * rand(50, 150) + nx * rand(10, 60),
         vy: (nx * tang) * rand(50, 150) + ny * rand(10, 60),
-        r: rand(R * 0.04, R * 0.11), life: 1, decay: rand(1.0, 1.8)
+        r: rand(r * 0.04, r * 0.11), life: 1, decay: rand(1.0, 1.8)
       });
     }
   }
 
-  function insideBall(x, y) {
-    var dx = x - body.x, dy = y - body.y;
-    return dx * dx + dy * dy <= (R * 1.15) * (R * 1.15);
+  function insideBall(b, x, y) {
+    var dx = x - b.x, dy = y - b.y, hr = Math.max(b.r * 1.15, 18);
+    return dx * dx + dy * dy <= hr * hr;
+  }
+
+  // ---- splitting ----
+  function distribute(list, pieces) {
+    // hand a share of the primary blob's stars/galaxies to the outgoing pieces
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (Math.random() < KEEP_AREA) continue;
+      var a = wrapAngle(body.heading + list[i].ang), best = 0, bd = 99;
+      for (var p = 0; p < pieces.length; p++) {
+        var d = Math.abs(wrapAngle(pieces[p].burstAng - a));
+        if (d < bd) { bd = d; best = p; }
+      }
+      var it = list.splice(i, 1)[0];
+      it.ang = wrapAngle(a - pieces[best].heading);
+      pieces[best][list === body.stars ? 'stars' : 'galaxies'].push(it);
+    }
+  }
+
+  function wobble(px, py) {
+    body.jiggle.t = 0; body.jiggle.amp = 0.12; body.jiggle.phase = Math.atan2(py - body.y, px - body.x);
   }
 
   function startSplat(cx, cy) {
-    splat.active = true;
-    splat.t = 0;
-    splat.pieces = [];
-    var K = SPLAT_PIECES, baseAng = rand(0, Math.PI * 2);
-    for (var i = 0; i < K; i++) {
+    finalizeMerges();
+    body.rf = body.rfBase; syncRadius(body);
+    var r0 = body.r;
+
+    // only the mass absorbed since the last split can be released again, and never more than MAX_PIECES in play
+    var K = MAX_PIECES - frags.length;
+    var A = body.rf * body.rf, keepA = KEEP_AREA, restA = A - keepA;
+    if (K <= 0 || restA < 1e-4) { wobble(cx, cy); return false; }
+    var wts = [], sum = 0;
+    for (var i = 0; i < K; i++) { var w = rand(0.7, 1.3); wts.push(w); sum += w; }
+
+    var baseAng = rand(0, Math.PI * 2), pieces = [];
+    for (i = 0; i < K; i++) {
       var ang = baseAng + (i / K) * Math.PI * 2 + rand(-0.25, 0.25);
       var dx = Math.cos(ang), dy = Math.sin(ang);
       // push pieces away from where the click landed
-      var sx = body.x + dx * R * 0.4, sy = body.y + dy * R * 0.4;
+      var sx = body.x + dx * r0 * 0.4, sy = body.y + dy * r0 * 0.4;
       var ax = sx - cx, ay = sy - cy, al = Math.sqrt(ax * ax + ay * ay) || 1;
-      var reach = R * rand(0.95, 1.45);
-      splat.pieces.push({
-        ang: ang,
-        ox: dx * reach + (ax / al) * R * 0.55,
-        oy: dy * reach + (ay / al) * R * 0.55,
-        r: R * rand(0.3, 0.42),
-        wob: rand(0, Math.PI * 2),
-        x: body.x, y: body.y, cr: R * 0.4
-      });
+      var reach = r0 * rand(1.35, 1.9);
+
+      var f = makeBlob(Math.sqrt(restA * wts[i] / sum));
+      f.state = 'burst';
+      f.ox = body.x; f.oy = body.y;
+      var tx = clamp(body.x + dx * reach + (ax / al) * r0 * 0.55, f.r, W - f.r);
+      var ty = clamp(body.y + dy * reach + (ay / al) * r0 * 0.55, f.r, H - f.r);
+      f.dx = tx - body.x; f.dy = ty - body.y;
+      f.x = body.x; f.y = body.y;
+      f.heading = Math.atan2(f.dy, f.dx);
+      f.burstAng = f.heading;
+      f.speed = f.targetSpeed = rand(FRAG_SPEED_MIN, FRAG_SPEED_MAX);
+      pieces.push(f);
     }
- 
-    for (i = 0; i < stars.length; i++) stars[i].piece = nearestPiece(stars[i].ang);
-    for (i = 0; i < galaxies.length; i++) galaxies[i].piece = nearestPiece(galaxies[i].ang);
+    distribute(body.stars, pieces);
+    distribute(body.galaxies, pieces);
+    frags = frags.concat(pieces);
 
     for (i = 0; i < 14; i++) {
       var a = rand(0, Math.PI * 2), sp = rand(120, 360);
-      drips.push({ x: cx + Math.cos(a) * R * 0.2, y: cy + Math.sin(a) * R * 0.2, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
-                   r: rand(R * 0.03, R * 0.1), life: 1, decay: rand(0.9, 1.6) });
+      drips.push({ x: cx + Math.cos(a) * r0 * 0.2, y: cy + Math.sin(a) * r0 * 0.2, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                   r: rand(r0 * 0.03, r0 * 0.1), life: 1, decay: rand(0.9, 1.6) });
     }
-    body.speed = 0;
-  }
 
-  function nearestPiece(ang) {
-    var a = wrapAngle(body.heading + ang), best = 0, bd = 99;
-    for (var i = 0; i < splat.pieces.length; i++) {
-      var d = Math.abs(wrapAngle(splat.pieces[i].ang - a));
-      if (d < bd) { bd = d; best = i; }
-    }
-    return best;
+    splat.active = true;
+    splat.t = 0;
+    splat.rfFrom = body.rf;
+    splat.rfTo = Math.sqrt(keepA);
+    splat.gooR = r0;
+    body.speed = 0;
+    playSplat();
+    return true;
   }
 
   function endSplat() {
     splat.active = false;
-    jiggle.t = 0; jiggle.amp = 0.14; jiggle.phase = rand(0, Math.PI * 2);
+    body.rfBase = splat.rfTo;
+    body.rf = body.rfBase; syncRadius(body);
+    body.jiggle.t = 0; body.jiggle.amp = 0.14; body.jiggle.phase = rand(0, Math.PI * 2);
     body.speed = SPEED_MIN * 0.4;   // eases back up to cruising speed
+    pickTarget();
+    for (var i = 0; i < frags.length; i++) {
+      var f = frags[i];
+      if (f.state !== 'burst') continue;
+      f.state = 'free';
+      f.jiggle.t = 0; f.jiggle.amp = 0.1; f.jiggle.phase = f.heading;
+    }
   }
 
-
-  function splatEnvelope(t) {
-    var out = 1 - Math.exp(-t * 13);
-    var back;
-    if (t < 0.32) back = 1;
-    else { var k = Math.min(1, (t - 0.32) / (splat.duration - 0.32)); back = 1 - k * k * (3 - 2 * k); }
-    return out * back;
+  // ---- absorbing ----
+  function startMerge(f) {
+    f.state = 'merging';
+    f.mt = 0; f.mk = 0;
+    f.sx = f.x; f.sy = f.y;
+    var dx = f.x - body.x, dy = f.y - body.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = dx / d, ny = dy / d;
+    f.entryAng = Math.atan2(dy, dx);
+    splash(body.x + nx * body.r, body.y + ny * body.r, nx, ny, Math.max(body.r, f.r));
+    body.jiggle.t = 0;
+    body.jiggle.amp = Math.min(0.18, 0.06 + 0.1 * (f.rf / Math.max(0.05, body.rf)));
+    body.jiggle.phase = f.entryAng;
   }
 
+  function finishMerge(f) {
+    var idx = frags.indexOf(f);
+    if (idx >= 0) frags.splice(idx, 1);
+    var rel = wrapAngle(f.entryAng - body.heading), i;
+    for (i = 0; i < f.stars.length; i++) {
+      f.stars[i].ang = wrapAngle(rel + rand(-0.7, 0.7));
+      body.stars.push(f.stars[i]);
+    }
+    for (i = 0; i < f.galaxies.length; i++) {
+      f.galaxies[i].ang = wrapAngle(rel + rand(-0.7, 0.7));
+      body.galaxies.push(f.galaxies[i]);
+    }
+    // conserve area: whatever isn't out in the fragments belongs to the primary blob
+    var sum = 0;
+    for (i = 0; i < frags.length; i++) sum += frags[i].rf * frags[i].rf;
+    body.rfBase = frags.length ? Math.sqrt(Math.max(0, 1 - sum)) : 1;
+    if (typeof gtag === 'function') gtag('event', 'blob_absorb', { remaining: frags.length });
+  }
+
+  function finalizeMerges() {
+    for (var i = frags.length - 1; i >= 0; i--) {
+      if (frags[i].state === 'merging') finishMerge(frags[i]);
+    }
+  }
+
+  // ---- input ----
   function pointerPos(e) {
     var rect = canvas.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
   var splatCount = 0;
-  var splatSound = new Audio('splat.mp3');
   canvas.addEventListener('pointerdown', function (e) {
     var pt = pointerPos(e);
-    if (!splat.active && insideBall(pt.x, pt.y)) {
-      startSplat(pt.x, pt.y);
-      splatSound.currentTime = 0;
-      splatSound.play().catch(function () {});
-      splatCount++;
-      if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount });
-    }
+    if (splat.active || !insideBall(body, pt.x, pt.y)) return;
+    if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
+    splatCount++;
+    if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount, fragments: frags.length });
   });
   canvas.addEventListener('pointermove', function (e) {
     var pt = pointerPos(e);
-    canvas.style.cursor = (!splat.active && insideBall(pt.x, pt.y)) ? 'pointer' : 'default';
+    canvas.style.cursor = (!splat.active && insideBall(body, pt.x, pt.y)) ? 'pointer' : 'default';
   });
 
-  function update(dt) {
-    time += dt;
-    squash.t += dt;
-    jiggle.t += dt;
-    squash.cooldown -= dt;
+  // ---- simulation ----
+  function tick(b, dt) {
+    b.squash.t += dt;
+    b.jiggle.t += dt;
+    b.squash.cooldown -= dt;
+  }
 
-    if (splat.active) {
-      splat.t += dt;
-      var env = splatEnvelope(splat.t);
-      var reform = splat.t < 0.32 ? 0 : Math.min(1, (splat.t - 0.32) / (splat.duration - 0.32));
-      for (var pi = 0; pi < splat.pieces.length; pi++) {
-        var pc = splat.pieces[pi];
-        pc.x = body.x + pc.ox * env;
-        pc.y = body.y + pc.oy * env;
-   
-        pc.cr = pc.r + (R * 0.92 - pc.r) * Math.pow(reform, 1.6);
-      }
-      if (splat.t >= splat.duration) endSplat();
-      updateDrips(dt);
-      for (pi = 0; pi < galaxies.length; pi++) galaxies[pi].ang += galaxies[pi].orbit * dt;
-      return;
+  function bounceWalls(b, maxSpeed) {
+    var r = b.r, hitNx = 0, hitNy = 0, hit = false;
+    if (b.x < r) { b.x = r; if (Math.cos(b.heading) < 0) { b.heading = wrapAngle(Math.PI - b.heading); hit = true; hitNx = 1; } }
+    if (b.x > W - r) { b.x = W - r; if (Math.cos(b.heading) > 0) { b.heading = wrapAngle(Math.PI - b.heading); hit = true; hitNx = -1; } }
+    if (b.y < r) { b.y = r; if (Math.sin(b.heading) < 0) { b.heading = -b.heading; hit = true; hitNy = 1; } }
+    if (b.y > H - r) { b.y = H - r; if (Math.sin(b.heading) > 0) { b.heading = -b.heading; hit = true; hitNy = -1; } }
+    if (hit && b.squash.cooldown <= 0) {
+      var nl = Math.sqrt(hitNx * hitNx + hitNy * hitNy) || 1;
+      b.squash.nx = hitNx / nl; b.squash.ny = hitNy / nl;
+      b.squash.t = 0;
+      b.squash.cooldown = 0.4;
+      b.jiggle.t = 0;
+      b.jiggle.amp = 0.05 + 0.06 * Math.min(1, b.speed / maxSpeed);
+      b.jiggle.phase = Math.atan2(b.squash.ny, b.squash.nx);
+      b.speed = Math.min(maxSpeed * 1.2, b.speed * 1.25);
+      splash(b.x - b.squash.nx * r, b.y - b.squash.ny * r, b.squash.nx, b.squash.ny, r);
+      return true;
     }
+    return false;
+  }
 
-
+  function moveBody(dt) {
+    if (target.frag) {
+      // keep chasing the fragment's current position; give up if it was absorbed or is mid-merge
+      if (target.frag.state === 'free' && frags.indexOf(target.frag) >= 0) { target.x = target.frag.x; target.y = target.frag.y; }
+      else pickTarget();
+    }
     var dx = target.x - body.x, dy = target.y - body.y;
     var dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < R * 1.2) pickTarget();
+    if (dist < body.r * 1.2) pickTarget();
     var desired = Math.atan2(dy, dx);
     var diff = wrapAngle(desired - body.heading);
     body.heading = wrapAngle(body.heading + Math.max(-TURN_RATE * dt, Math.min(TURN_RATE * dt, diff)));
 
     body.speed += (body.targetSpeed - body.speed) * Math.min(1, dt * 0.8);
-    var stroke = 1 + 0.12 * Math.sin(time * 4.5); 
+    var stroke = 1 + 0.12 * Math.sin(time * 4.5);
     var wobble = Math.sin(time * 4.5) * 0.08;
     var v = body.speed * stroke;
     body.x += Math.cos(body.heading + wobble) * v * dt;
     body.y += Math.sin(body.heading + wobble) * v * dt;
 
-   
-    var hitNx = 0, hitNy = 0, hit = false;
-    if (body.x < R) { body.x = R; if (Math.cos(body.heading) < 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = 1; } }
-    if (body.x > W - R) { body.x = W - R; if (Math.cos(body.heading) > 0) { body.heading = wrapAngle(Math.PI - body.heading); hit = true; hitNx = -1; } }
-    if (body.y < R) { body.y = R; if (Math.sin(body.heading) < 0) { body.heading = -body.heading; hit = true; hitNy = 1; } }
-    if (body.y > H - R) { body.y = H - R; if (Math.sin(body.heading) > 0) { body.heading = -body.heading; hit = true; hitNy = -1; } }
-    if (hit && squash.cooldown <= 0) {
-      var nl = Math.sqrt(hitNx * hitNx + hitNy * hitNy) || 1;
-      squash.nx = hitNx / nl; squash.ny = hitNy / nl;
-      squash.t = 0;
-      squash.cooldown = 0.4;
-      jiggle.t = 0;
-      jiggle.amp = 0.05 + 0.06 * Math.min(1, body.speed / SPEED_MAX);
-      jiggle.phase = Math.atan2(squash.ny, squash.nx);
-      body.speed = Math.min(SPEED_MAX * 1.2, body.speed * 1.25);
-      splash(body.x - squash.nx * R, body.y - squash.ny * R, squash.nx, squash.ny);
-    
+    if (bounceWalls(body, SPEED_MAX)) {
+      var sq = body.squash;
       pickTarget();
-      if ((squash.nx > 0 && target.x < body.x) || (squash.nx < 0 && target.x > body.x) ||
-          (squash.ny > 0 && target.y < body.y) || (squash.ny < 0 && target.y > body.y)) {
+      if ((sq.nx > 0 && target.x < body.x) || (sq.nx < 0 && target.x > body.x) ||
+          (sq.ny > 0 && target.y < body.y) || (sq.ny < 0 && target.y > body.y)) {
         target.x = W - target.x; target.y = H - target.y;
       }
     }
+  }
+
+  function updateFrags(dt) {
+    for (var i = frags.length - 1; i >= 0; i--) {
+      var f = frags[i];
+      if (f.state === 'burst') continue;
+
+      if (f.state === 'merging') {
+        f.mt += dt;
+        var k = smooth01(f.mt / MERGE_TIME);
+        f.mk = k;
+        f.x = f.sx + (body.x - f.sx) * k;
+        f.y = f.sy + (body.y - f.sy) * k;
+        f.r = R * f.rf * (1 - k);
+        if (f.mt >= MERGE_TIME) finishMerge(f);
+        continue;
+      }
+
+      // free drift out in space
+      f.heading = wrapAngle(f.heading + rand(-1, 1) * FRAG_WANDER * dt);
+      if (Math.random() < dt * 0.15) f.targetSpeed = rand(FRAG_SPEED_MIN, FRAG_SPEED_MAX);
+      f.speed += (f.targetSpeed - f.speed) * Math.min(1, dt * 0.8);
+      f.x += Math.cos(f.heading) * f.speed * dt;
+      f.y += Math.sin(f.heading) * f.speed * dt;
+      f.r = R * f.rf;
+      bounceWalls(f, FRAG_SPEED_MAX);
+
+      if (!splat.active) {
+        var dx = f.x - body.x, dy = f.y - body.y;
+        var touch = body.r + f.r * 0.75;
+        if (dx * dx + dy * dy < touch * touch) startMerge(f);
+      }
+    }
+  }
+
+  function update(dt) {
+    time += dt;
+    tick(body, dt);
+    var i;
+    for (i = 0; i < frags.length; i++) tick(frags[i], dt);
+
+    if (splat.active) {
+      splat.t += dt;
+      var k = smooth01(splat.t / 0.35);
+      body.rf = splat.rfFrom + (splat.rfTo - splat.rfFrom) * k;
+      syncRadius(body);
+      var env = 1 - Math.exp(-splat.t * 13);
+      for (i = 0; i < frags.length; i++) {
+        var f = frags[i];
+        if (f.state !== 'burst') continue;
+        f.x = f.ox + f.dx * env;
+        f.y = f.oy + f.dy * env;
+        f.r = R * f.rf;
+      }
+      if (splat.t >= BURST_TIME) endSplat();
+    } else {
+      moveBody(dt);
+    }
+
+    updateFrags(dt);
+
+    if (!splat.active) {
+      // primary grows as fragments are absorbed
+      var extra = 0;
+      for (i = 0; i < frags.length; i++) {
+        if (frags[i].state === 'merging') extra += frags[i].rf * frags[i].rf * frags[i].mk;
+      }
+      body.rf = Math.sqrt(body.rfBase * body.rfBase + extra);
+      syncRadius(body);
+    }
 
     updateDrips(dt);
-    for (var i = 0; i < galaxies.length; i++) galaxies[i].ang += galaxies[i].orbit * dt;
+    for (i = 0; i < body.galaxies.length; i++) body.galaxies[i].ang += body.galaxies[i].orbit * dt;
+    for (i = 0; i < frags.length; i++) {
+      var gs = frags[i].galaxies;
+      for (var g = 0; g < gs.length; g++) gs[g].ang += gs[g].orbit * dt;
+    }
   }
 
   function updateDrips(dt) {
@@ -338,23 +515,22 @@
     }
   }
 
-  var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
-
-  function ballPoint(ang, dist, out) {
-    var a = body.heading + ang;
-    return deform(body.x + Math.cos(a) * dist * R, body.y + Math.sin(a) * dist * R, out);
+  // ---- drawing ----
+  function ballPoint(b, ang, dist, out) {
+    var a = b.heading + ang;
+    return deform(b, b.x + Math.cos(a) * dist * b.r, b.y + Math.sin(a) * dist * b.r, out);
   }
 
-  function tracePath() {
+  function tracePath(c, b) {
     var steps = 72;
-    ctx.beginPath();
+    c.beginPath();
     for (var k = 0; k <= steps; k++) {
       var th = (k / steps) * Math.PI * 2;
-      var rr = R * surface(th);
-      deform(body.x + Math.cos(th) * rr, body.y + Math.sin(th) * rr, tmp2);
-      if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
+      var rr = b.r * surface(b, th);
+      deform(b, b.x + Math.cos(th) * rr, b.y + Math.sin(th) * rr, tmp2);
+      if (k === 0) c.moveTo(tmp2.x, tmp2.y); else c.lineTo(tmp2.x, tmp2.y);
     }
-    ctx.closePath();
+    c.closePath();
   }
 
   function drawDrips() {
@@ -373,50 +549,45 @@
     }
   }
 
-  function draw() {
-    ctx.clearRect(0, 0, W, H);
-    drawDrips();
-    if (splat.active) { drawSplat(); return; }
-
-    deform(body.x, body.y, tmp2);
+  function drawBlob(b) {
+    var r = b.r;
+    if (r < 0.5) return;
+    deform(b, b.x, b.y, tmp2);
     var cx = tmp2.x, cy = tmp2.y;
-
+    var box = r * 1.7, i;
 
     ctx.save();
-    tracePath();
+    tracePath(ctx, b);
     ctx.shadowColor = 'rgba(168,85,247,0.55)';
-    ctx.shadowBlur = R * 0.8;
+    ctx.shadowBlur = r * 0.8;
     ctx.fillStyle = '#3b0a6e';
     ctx.fill();
     ctx.restore();
 
-
     ctx.save();
-    tracePath();
+    tracePath(ctx, b);
     ctx.clip();
 
-    var base = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.3, R * 0.05, cx, cy, R * 1.5);
+    var base = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.05, cx, cy, r * 1.5);
     base.addColorStop(0, '#7c3aed');
     base.addColorStop(0.3, '#5b21b6');
     base.addColorStop(0.65, '#3b0a6e');
     base.addColorStop(1, '#1a0538');
     ctx.fillStyle = base;
-    ctx.fillRect(0, 0, W, H);
-
+    ctx.fillRect(cx - box, cy - box, box * 2, box * 2);
 
     ctx.globalCompositeOperation = 'multiply';
-    var vg = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 1.1);
+    var vg = ctx.createRadialGradient(cx, cy, r * 0.5, cx, cy, r * 1.1);
     vg.addColorStop(0, 'rgba(255,255,255,1)');
     vg.addColorStop(1, 'rgba(130,100,185,1)');
     ctx.fillStyle = vg;
-    ctx.fillRect(0, 0, W, H);
-
+    ctx.fillRect(cx - box, cy - box, box * 2, box * 2);
 
     ctx.globalCompositeOperation = 'screen';
-    for (var i = 0; i < galaxies.length; i++) {
-      var g = galaxies[i];
-      ballPoint(g.ang, g.dist, tmp);
-      var gr = R * g.size;
+    for (i = 0; i < b.galaxies.length; i++) {
+      var g = b.galaxies[i];
+      ballPoint(b, g.ang, g.dist, tmp);
+      var gr = r * g.size;
       var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
       var gg = ctx.createRadialGradient(tmp.x, tmp.y, 0, tmp.x, tmp.y, gr);
       gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
@@ -443,11 +614,10 @@
       ctx.restore();
     }
 
-
     ctx.globalCompositeOperation = 'lighter';
-    for (i = 0; i < stars.length; i++) {
-      var st = stars[i];
-      ballPoint(st.ang, st.dist, tmp);
+    for (i = 0; i < b.stars.length; i++) {
+      var st = b.stars[i];
+      ballPoint(b, st.ang, st.dist, tmp);
       var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
       ctx.fillStyle = 'rgba(255,255,255,' + al + ')';
       ctx.beginPath(); ctx.arc(tmp.x, tmp.y, st.size, 0, Math.PI * 2); ctx.fill();
@@ -457,89 +627,88 @@
       }
     }
 
-
     ctx.globalCompositeOperation = 'screen';
     ctx.lineCap = 'round';
     ctx.strokeStyle = 'rgba(233,213,255,0.45)';
-    ctx.lineWidth = Math.max(1.5, R * 0.09);
+    ctx.lineWidth = Math.max(1.5, r * 0.09);
     ctx.beginPath();
     for (var k = 0; k <= 16; k++) {
       var th = -2.7 + (2.0 * k / 16);
-      deform(body.x + Math.cos(th) * R * 0.78, body.y + Math.sin(th) * R * 0.78, tmp2);
+      deform(b, b.x + Math.cos(th) * r * 0.78, b.y + Math.sin(th) * r * 0.78, tmp2);
       if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
     }
     ctx.stroke();
     ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx.lineWidth = Math.max(0.8, R * 0.035);
+    ctx.lineWidth = Math.max(0.8, r * 0.035);
     ctx.beginPath();
     for (k = 0; k <= 8; k++) {
       th = -2.5 + (1.0 * k / 8);
-      deform(body.x + Math.cos(th) * R * 0.85, body.y + Math.sin(th) * R * 0.85, tmp2);
+      deform(b, b.x + Math.cos(th) * r * 0.85, b.y + Math.sin(th) * r * 0.85, tmp2);
       if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
     }
     ctx.stroke();
 
     ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-    ctx.lineWidth = Math.max(0.8, R * 0.03);
+    ctx.lineWidth = Math.max(0.8, r * 0.03);
     ctx.beginPath();
     for (k = 0; k <= 6; k++) {
       th = 0.5 + (0.6 * k / 6);
-      deform(body.x + Math.cos(th) * R * 0.86, body.y + Math.sin(th) * R * 0.86, tmp2);
+      deform(b, b.x + Math.cos(th) * r * 0.86, b.y + Math.sin(th) * r * 0.86, tmp2);
       if (k === 0) ctx.moveTo(tmp2.x, tmp2.y); else ctx.lineTo(tmp2.x, tmp2.y);
     }
     ctx.stroke();
 
-
     ctx.restore();
 
-
     ctx.save();
-    tracePath();
+    tracePath(ctx, b);
     ctx.lineJoin = 'round';
     ctx.strokeStyle = 'rgba(217,70,239,0.9)';
-    ctx.lineWidth = Math.max(1.5, R * 0.04);
+    ctx.lineWidth = Math.max(1.5, r * 0.04);
     ctx.shadowColor = 'rgba(217,70,239,0.9)';
-    ctx.shadowBlur = R * 0.4;
+    ctx.shadowBlur = r * 0.4;
     ctx.stroke();
     ctx.strokeStyle = 'rgba(250,232,255,0.55)';
-    ctx.lineWidth = Math.max(0.8, R * 0.016);
+    ctx.lineWidth = Math.max(0.8, r * 0.016);
     ctx.shadowBlur = 0;
     ctx.stroke();
     ctx.restore();
   }
 
-
   function sizeGoo(c, wpx, hpx) {
     if (c.width !== wpx || c.height !== hpx) { c.width = wpx; c.height = hpx; }
     return c.getContext('2d');
   }
-  function smooth(a, b, x) { var k = Math.max(0, Math.min(1, (x - a) / (b - a))); return k * k * (3 - 2 * k); }
 
-  function drawSplat() {
-    var pad = R * 0.6;
+  // gooey metaball pass used while the blob is tearing apart:
+  // the (shrinking) primary and the outgoing pieces are rendered as one merged surface
+  function drawGoo() {
+    var items = [body], i, pc;
+    for (i = 0; i < frags.length; i++) if (frags[i].state === 'burst') items.push(frags[i]);
+
+    var gR = splat.gooR, pad = gR * 0.6;
     var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
-    for (var i = 0; i < splat.pieces.length; i++) {
-      var pc = splat.pieces[i];
-      minX = Math.min(minX, pc.x - pc.cr); maxX = Math.max(maxX, pc.x + pc.cr);
-      minY = Math.min(minY, pc.y - pc.cr); maxY = Math.max(maxY, pc.y + pc.cr);
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
+      minX = Math.min(minX, pc.x - pc.r); maxX = Math.max(maxX, pc.x + pc.r);
+      minY = Math.min(minY, pc.y - pc.r); maxY = Math.max(maxY, pc.y + pc.r);
     }
     var ox = Math.floor(minX - pad), oy = Math.floor(minY - pad);
     var w = Math.ceil(maxX + pad) - ox, h = Math.ceil(maxY + pad) - oy;
     var wpx = Math.max(1, Math.ceil(w * dpr)), hpx = Math.max(1, Math.ceil(h * dpr));
 
-
     var sc = sizeGoo(gooSrc, wpx, hpx);
     sc.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
     sc.clearRect(ox, oy, w, h);
-    if (canFilter) sc.filter = 'blur(' + (R * 0.2) + 'px)';
+    if (canFilter) sc.filter = 'blur(' + (gR * 0.15) + 'px)';
     sc.fillStyle = '#000';
-    for (i = 0; i < splat.pieces.length; i++) {
-      pc = splat.pieces[i];
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
       sc.beginPath();
       var steps = 28;
       for (var k = 0; k <= steps; k++) {
         var th = (k / steps) * Math.PI * 2;
-        var rr = pc.cr * (1 + 0.09 * Math.sin(3 * th + time * 6 + pc.wob) + 0.05 * Math.sin(5 * th - time * 8));
+        var rr = pc.r * (1 + 0.09 * Math.sin(3 * th + time * 6 + pc.wob) + 0.05 * Math.sin(5 * th - time * 8));
         var px = pc.x + Math.cos(th) * rr, py = pc.y + Math.sin(th) * rr;
         if (k === 0) sc.moveTo(px, py); else sc.lineTo(px, py);
       }
@@ -547,7 +716,6 @@
     }
     if (canFilter) sc.filter = 'none';
 
- 
     var img = sc.getImageData(0, 0, wpx, hpx);
     var d = img.data, n = d.length;
     var rimImg = new ImageData(wpx, hpx), rd = rimImg.data;
@@ -560,82 +728,85 @@
     var mc = sizeGoo(gooMask, wpx, hpx); mc.setTransform(1, 0, 0, 1, 0, 0); mc.putImageData(img, 0, 0);
     var rc = sizeGoo(gooRim, wpx, hpx); rc.setTransform(1, 0, 0, 1, 0, 0); rc.putImageData(rimImg, 0, 0);
 
-
     var bc = sizeGoo(gooBody, wpx, hpx);
     bc.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
     bc.globalCompositeOperation = 'source-over';
     bc.clearRect(ox, oy, w, h);
     bc.fillStyle = '#2a0a52';
     bc.fillRect(ox, oy, w, h);
-    var reform = splat.t < 0.32 ? 0 : Math.min(1, (splat.t - 0.32) / (splat.duration - 0.32));
-    var starScale = 0.55 + 0.45 * reform, galScale = 0.7 + 0.3 * reform;
-    bc.globalCompositeOperation = 'source-over';
-    for (i = 0; i < splat.pieces.length; i++) {
-      pc = splat.pieces[i];
-      var pg = bc.createRadialGradient(pc.x - pc.cr * 0.3, pc.y - pc.cr * 0.3, pc.cr * 0.05, pc.x, pc.y, pc.cr * 1.1);
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
+      var pg = bc.createRadialGradient(pc.x - pc.r * 0.3, pc.y - pc.r * 0.3, pc.r * 0.05, pc.x, pc.y, pc.r * 1.1);
       pg.addColorStop(0, 'rgba(124,58,237,0.9)');
       pg.addColorStop(0.45, 'rgba(91,33,182,0.5)');
       pg.addColorStop(1, 'rgba(59,10,110,0)');
       bc.fillStyle = pg;
-      bc.beginPath(); bc.arc(pc.x, pc.y, pc.cr * 1.1, 0, Math.PI * 2); bc.fill();
+      bc.beginPath(); bc.arc(pc.x, pc.y, pc.r * 1.1, 0, Math.PI * 2); bc.fill();
     }
 
-    if (reform > 0) {
-      var cg = bc.createRadialGradient(body.x - R * 0.3, body.y - R * 0.3, R * 0.05, body.x, body.y, R * 1.2);
-      cg.addColorStop(0, 'rgba(124,58,237,' + (0.95 * reform) + ')');
-      cg.addColorStop(0.35, 'rgba(91,33,182,' + (0.7 * reform) + ')');
-      cg.addColorStop(1, 'rgba(59,10,110,0)');
-      bc.fillStyle = cg;
-      bc.beginPath(); bc.arc(body.x, body.y, R * 1.2, 0, Math.PI * 2); bc.fill();
-    }
     bc.globalCompositeOperation = 'screen';
-    for (i = 0; i < galaxies.length; i++) {
-      var g = galaxies[i]; pc = splat.pieces[g.piece];
-      var a2 = body.heading + g.ang;
-      var gx = pc.x + Math.cos(a2) * g.dist * R * galScale, gy = pc.y + Math.sin(a2) * g.dist * R * galScale;
-      var gr = R * g.size * 0.8;
-      var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
-      var gg = bc.createRadialGradient(gx, gy, 0, gx, gy, gr);
-      gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
-      gg.addColorStop(0.25, g.color + (0.45 * pulse) + ')');
-      gg.addColorStop(1, g.color + '0)');
-      bc.fillStyle = gg;
-      bc.beginPath(); bc.arc(gx, gy, gr, 0, Math.PI * 2); bc.fill();
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
+      for (var gi = 0; gi < pc.galaxies.length; gi++) {
+        var g = pc.galaxies[gi];
+        var a2 = pc.heading + g.ang;
+        var gx = pc.x + Math.cos(a2) * g.dist * pc.r, gy = pc.y + Math.sin(a2) * g.dist * pc.r;
+        var gr = pc.r * g.size * 0.8;
+        var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
+        var gg = bc.createRadialGradient(gx, gy, 0, gx, gy, gr);
+        gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
+        gg.addColorStop(0.25, g.color + (0.45 * pulse) + ')');
+        gg.addColorStop(1, g.color + '0)');
+        bc.fillStyle = gg;
+        bc.beginPath(); bc.arc(gx, gy, gr, 0, Math.PI * 2); bc.fill();
+      }
     }
     bc.globalCompositeOperation = 'lighter';
-    for (i = 0; i < stars.length; i++) {
-      var st = stars[i]; pc = splat.pieces[st.piece];
-      a2 = body.heading + st.ang;
-      var sx = pc.x + Math.cos(a2) * st.dist * R * starScale, sy = pc.y + Math.sin(a2) * st.dist * R * starScale;
-      var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
-      bc.fillStyle = 'rgba(255,255,255,' + al + ')';
-      bc.beginPath(); bc.arc(sx, sy, st.size, 0, Math.PI * 2); bc.fill();
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
+      for (var si = 0; si < pc.stars.length; si++) {
+        var st = pc.stars[si];
+        var a3 = pc.heading + st.ang;
+        var sx = pc.x + Math.cos(a3) * st.dist * pc.r, sy = pc.y + Math.sin(a3) * st.dist * pc.r;
+        var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
+        bc.fillStyle = 'rgba(255,255,255,' + al + ')';
+        bc.beginPath(); bc.arc(sx, sy, st.size, 0, Math.PI * 2); bc.fill();
+      }
     }
 
     bc.globalCompositeOperation = 'screen';
     bc.lineCap = 'round';
     bc.strokeStyle = 'rgba(255,255,255,0.7)';
-    bc.lineWidth = Math.max(0.8, R * 0.03);
-    for (i = 0; i < splat.pieces.length; i++) {
-      pc = splat.pieces[i];
-      bc.beginPath(); bc.arc(pc.x, pc.y, pc.cr * 0.72, -2.4, -1.5); bc.stroke();
+    bc.lineWidth = Math.max(0.8, gR * 0.03);
+    for (i = 0; i < items.length; i++) {
+      pc = items[i];
+      bc.beginPath(); bc.arc(pc.x, pc.y, pc.r * 0.72, -2.4, -1.5); bc.stroke();
     }
     bc.globalCompositeOperation = 'destination-in';
     bc.setTransform(1, 0, 0, 1, 0, 0);
     bc.drawImage(gooMask, 0, 0);
 
-
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     var dx = ox * dpr, dy = oy * dpr;
     ctx.shadowColor = 'rgba(168,85,247,0.6)';
-    ctx.shadowBlur = R * 0.7 * dpr;
+    ctx.shadowBlur = gR * 0.7 * dpr;
     ctx.drawImage(gooRim, dx, dy);
     ctx.shadowBlur = 0;
     ctx.drawImage(gooRim, dx, dy);
     ctx.drawImage(gooBody, dx, dy);
     ctx.restore();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    drawDrips();
+    // drifting / merging fragments sit behind the primary blob
+    for (var i = 0; i < frags.length; i++) {
+      if (frags[i].state !== 'burst') drawBlob(frags[i]);
+    }
+    if (splat.active) drawGoo(); else drawBlob(body);
   }
 
   function frame(now) {
