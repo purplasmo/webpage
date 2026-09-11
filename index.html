@@ -245,11 +245,13 @@
     var rect = canvas.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
+  var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
     var pt = pointerPos(e);
     if (!splat.active && insideBall(pt.x, pt.y)) {
       startSplat(pt.x, pt.y);
-      if (typeof gtag === 'function') gtag('event', 'blob_splat');
+      splatCount++;
+      if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount });
     }
   });
   canvas.addEventListener('pointermove', function (e) {
