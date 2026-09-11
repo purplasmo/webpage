@@ -51,11 +51,23 @@
   var MAX_PIECES = 8;          // hard cap on fragments in play; a click releases only what has been re-absorbed
   var KEEP_AREA = 0.30;        // fixed "core" area (fraction of full size) the primary always keeps
   var BURST_TIME = 0.5;        // seconds of gooey separation before fragments drift freely
-  var MERGE_TIME = 0.35;       // seconds for a fragment to be absorbed
+  var MERGE_TIME = 0.5;        // seconds for a fragment to sink into the primary
+  var CAPTURE_RANGE = 1.3;     // fragments within primary radius * this (+ own radius) get pulled in
+  var PULL_ACCEL = 2600;       // px/s^2 of magnetic pull at point-blank range
+  var PULL_MAX = 520;          // cap on pull speed (px/s)
+  var TUG_STRETCH = 0.55;      // how much a pulled fragment elongates toward the primary
   var FRAG_SPEED_MIN = 35, FRAG_SPEED_MAX = 90;
   var FRAG_WANDER = 0.7;       // how much fragments meander (rad/s of heading noise)
   var HUNT_CHANCE = 0.6;       // chance the primary blob chases a fragment when it picks a new target
   var SOUND_SRC = 'splat.mp3';
+
+  // marble mode (phones/tablets with a motion sensor)
+  var MARBLE_ACCEL = 1900;     // px/s^2 at a full 90 degree tilt
+  var MARBLE_MAX_SPEED = 950;  // px/s
+  var MARBLE_FRICTION = 0.45;  // rolling drag (1/s)
+  var MARBLE_BOUNCE = 0.55;    // wall restitution
+  var TILT_DEADZONE = 0.03;    // ignore sensor noise below this (fraction of g)
+  var TILT_SMOOTH = 12;        // low-pass rate for the tilt reading
 
   var R = BASE_R;              // full-size radius (screen scaled); every blob stores rf = radius / R
   var time = 0, last = performance.now();
@@ -67,6 +79,10 @@
   body.speed = 150; body.targetSpeed = 150;
 
   var splat = { active: false, t: 0, rfFrom: 1, rfTo: 1, gooR: BASE_R };
+
+  // tilt: raw = latest sensor reading mapped to screen axes (fraction of g), x/y = smoothed
+  var tilt = { enabled: false, rawX: 0, rawY: 0, x: 0, y: 0 };
+  body.vx = 0; body.vy = 0;
 
   var gooSrc = document.createElement('canvas'), gooRim = document.createElement('canvas'),
       gooMask = document.createElement('canvas'), gooBody = document.createElement('canvas');
@@ -91,6 +107,8 @@
       jiggle: { amp: 0, t: 99, phase: 0 },
       phase: rand(0, Math.PI * 2), wob: rand(0, Math.PI * 2),
       stars: [], galaxies: [],
+      pvx: 0, pvy: 0,                 // magnetic pull velocity
+      tug: 0, tugX: 1, tugY: 0,       // stretch toward the primary (0..1, unit direction)
       state: 'free', mt: 0, mk: 0
     };
   }
@@ -171,14 +189,22 @@
   function deform(b, px, py, out) {
     var rx = px - b.x, ry = py - b.y;
 
-    // motion stretch
+    // motion stretch along the heading, or along the pull direction when being drawn in
     var sf = Math.max(0, Math.min(1, b.speed / SPEED_MAX));
     var hx = Math.cos(b.heading), hy = Math.sin(b.heading);
+    var stretch = STRETCH * sf;
+    var tug = b.tug > 0.001 ? b.tug : 0;
+    if (tug) { hx = b.tugX; hy = b.tugY; stretch += TUG_STRETCH * tug; }
     var al = rx * hx + ry * hy;
     var pxp = rx - al * hx, pyp = ry - al * hy;
-    var sa = 1 + STRETCH * sf, sp = 1 - STRETCH * 0.6 * sf;
+    var sa = 1 + stretch, sp = Math.max(0.55, 1 - stretch * 0.6);
     rx = pxp * sp + al * sa * hx;
     ry = pyp * sp + al * sa * hy;
+    if (tug) {
+      // teardrop: the side facing the primary reaches out further than the far side
+      al = rx * hx + ry * hy;
+      if (al > 0) { var e = al * 0.7 * tug; rx += hx * e; ry += hy * e; }
+    }
 
     // wall squash
     var amt = squashAmount(b.squash);
@@ -303,7 +329,8 @@
     body.rfBase = splat.rfTo;
     body.rf = body.rfBase; syncRadius(body);
     body.jiggle.t = 0; body.jiggle.amp = 0.14; body.jiggle.phase = rand(0, Math.PI * 2);
-    body.speed = SPEED_MIN * 0.4;   // eases back up to cruising speed
+    body.speed = tilt.enabled ? 0 : SPEED_MIN * 0.4;   // wander mode eases back up to cruising speed
+    body.vx = 0; body.vy = 0;                          // marble mode starts again from rest
     pickTarget();
     for (var i = 0; i < frags.length; i++) {
       var f = frags[i];
@@ -321,9 +348,10 @@
     var dx = f.x - body.x, dy = f.y - body.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
     var nx = dx / d, ny = dy / d;
     f.entryAng = Math.atan2(dy, dx);
-    splash(body.x + nx * body.r, body.y + ny * body.r, nx, ny, Math.max(body.r, f.r));
+    f.tug = 1; f.tugX = -nx; f.tugY = -ny;
+    splash(body.x + nx * body.r, body.y + ny * body.r, nx, ny, Math.max(body.r, f.r) * 0.7);
     body.jiggle.t = 0;
-    body.jiggle.amp = Math.min(0.18, 0.06 + 0.1 * (f.rf / Math.max(0.05, body.rf)));
+    body.jiggle.amp = Math.min(0.16, 0.05 + 0.08 * (f.rf / Math.max(0.05, body.rf)));
     body.jiggle.phase = f.entryAng;
   }
 
@@ -343,6 +371,8 @@
     var sum = 0;
     for (i = 0; i < frags.length; i++) sum += frags[i].rf * frags[i].rf;
     body.rfBase = frags.length ? Math.sqrt(Math.max(0, 1 - sum)) : 1;
+    // swallow ripple
+    body.jiggle.t = 0; body.jiggle.amp = 0.09; body.jiggle.phase = f.entryAng;
     if (typeof gtag === 'function') gtag('event', 'blob_absorb', { remaining: frags.length });
   }
 
@@ -359,6 +389,7 @@
   }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
+    requestTilt();
     var pt = pointerPos(e);
     if (splat.active || !insideBall(body, pt.x, pt.y)) return;
     if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
@@ -369,6 +400,85 @@
     var pt = pointerPos(e);
     canvas.style.cursor = (!splat.active && insideBall(body, pt.x, pt.y)) ? 'pointer' : 'default';
   });
+
+  // ---- tilt / accelerometer ----
+  function screenAngle() {
+    if (window.screen && screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+    if (typeof window.orientation === 'number') return window.orientation;
+    return 0;
+  }
+
+  function onOrientation(e) {
+    if (e.beta === null || e.gamma === null || e.beta === undefined) return;
+    // gamma: right edge down -> positive; beta: top edge raised -> positive (marble rolls toward the bottom)
+    var gx = Math.sin(Math.max(-90, Math.min(90, e.gamma)) * Math.PI / 180);
+    var gy = Math.sin(Math.max(-90, Math.min(90, e.beta)) * Math.PI / 180);
+    // rotate device axes into screen axes for landscape orientations
+    var a = screenAngle() * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    tilt.rawX = gx * ca + gy * sa;
+    tilt.rawY = -gx * sa + gy * ca;
+    if (!tilt.enabled) {
+      tilt.enabled = true;
+      body.vx = Math.cos(body.heading) * body.speed;
+      body.vy = Math.sin(body.heading) * body.speed;
+    }
+  }
+
+  var tiltRequested = false;
+  function requestTilt() {
+    if (tiltRequested) return;
+    tiltRequested = true;
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iOS 13+: must be called from a user gesture, and only works over https
+      DeviceOrientationEvent.requestPermission().then(function (state) {
+        if (state === 'granted') window.addEventListener('deviceorientation', onOrientation);
+      }).catch(function () {});
+    }
+  }
+
+  if (typeof DeviceOrientationEvent !== 'undefined') {
+    // Android and older iOS fire without asking; iOS 13+ needs the tap above
+    window.addEventListener('deviceorientation', onOrientation);
+  }
+
+  function moveMarble(dt) {
+    tilt.x += (tilt.rawX - tilt.x) * Math.min(1, dt * TILT_SMOOTH);
+    tilt.y += (tilt.rawY - tilt.y) * Math.min(1, dt * TILT_SMOOTH);
+    var tx = tilt.x, ty = tilt.y, tm = Math.sqrt(tx * tx + ty * ty);
+    if (tm < TILT_DEADZONE) { tx = 0; ty = 0; }
+    else { var k = (tm - TILT_DEADZONE) / tm; tx *= k; ty *= k; }
+
+    body.vx += tx * MARBLE_ACCEL * dt;
+    body.vy += ty * MARBLE_ACCEL * dt;
+    var damp = Math.exp(-MARBLE_FRICTION * dt);
+    body.vx *= damp; body.vy *= damp;
+    var sp = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+    if (sp > MARBLE_MAX_SPEED) { body.vx *= MARBLE_MAX_SPEED / sp; body.vy *= MARBLE_MAX_SPEED / sp; sp = MARBLE_MAX_SPEED; }
+    body.x += body.vx * dt;
+    body.y += body.vy * dt;
+
+    // walls: bounce the velocity and squash on impact
+    var r = body.r, hit = false, nx = 0, ny = 0, impact = 0;
+    if (body.x < r) { body.x = r; if (body.vx < 0) { impact = -body.vx; body.vx = -body.vx * MARBLE_BOUNCE; hit = true; nx = 1; } }
+    if (body.x > W - r) { body.x = W - r; if (body.vx > 0) { impact = body.vx; body.vx = -body.vx * MARBLE_BOUNCE; hit = true; nx = -1; } }
+    if (body.y < r) { body.y = r; if (body.vy < 0) { impact = Math.max(impact, -body.vy); body.vy = -body.vy * MARBLE_BOUNCE; hit = true; ny = 1; } }
+    if (body.y > H - r) { body.y = H - r; if (body.vy > 0) { impact = Math.max(impact, body.vy); body.vy = -body.vy * MARBLE_BOUNCE; hit = true; ny = -1; } }
+    if (hit && impact > 40 && body.squash.cooldown <= 0) {
+      var nl = Math.sqrt(nx * nx + ny * ny) || 1;
+      body.squash.nx = nx / nl; body.squash.ny = ny / nl;
+      body.squash.t = 0;
+      body.squash.cooldown = 0.25;
+      var str = Math.min(1, impact / MARBLE_MAX_SPEED);
+      body.jiggle.t = 0;
+      body.jiggle.amp = 0.04 + 0.1 * str;
+      body.jiggle.phase = Math.atan2(body.squash.ny, body.squash.nx);
+      if (impact > 120) splash(body.x - body.squash.nx * r, body.y - body.squash.ny * r, body.squash.nx, body.squash.ny, r);
+    }
+
+    sp = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+    body.speed = sp;
+    if (sp > 4) body.heading = Math.atan2(body.vy, body.vx);
+  }
 
   // ---- simulation ----
   function tick(b, dt) {
@@ -433,13 +543,20 @@
       var f = frags[i];
       if (f.state === 'burst') continue;
 
+      var dx = body.x - f.x, dy = body.y - f.y;
+      var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      var ux = dx / dist, uy = dy / dist;
+
       if (f.state === 'merging') {
         f.mt += dt;
         var k = smooth01(f.mt / MERGE_TIME);
-        f.mk = k;
-        f.x = f.sx + (body.x - f.sx) * k;
-        f.y = f.sy + (body.y - f.sy) * k;
-        f.r = R * f.rf * (1 - k);
+        f.mk = smooth(0.15, 1, k);                    // primary gains the mass as it flows in
+        var ex = Math.cos(f.entryAng), ey = Math.sin(f.entryAng);
+        var tx = body.x + ex * body.r * 0.35, ty = body.y + ey * body.r * 0.35;
+        f.x = f.sx + (tx - f.sx) * k;
+        f.y = f.sy + (ty - f.sy) * k;
+        f.r = R * f.rf * (1 - 0.95 * smooth(0.45, 1, k));  // holds shape while the neck forms, then dissolves
+        f.tug = 1 - 0.6 * k; f.tugX = -ex; f.tugY = -ey;
         if (f.mt >= MERGE_TIME) finishMerge(f);
         continue;
       }
@@ -448,14 +565,30 @@
       f.heading = wrapAngle(f.heading + rand(-1, 1) * FRAG_WANDER * dt);
       if (Math.random() < dt * 0.15) f.targetSpeed = rand(FRAG_SPEED_MIN, FRAG_SPEED_MAX);
       f.speed += (f.targetSpeed - f.speed) * Math.min(1, dt * 0.8);
-      f.x += Math.cos(f.heading) * f.speed * dt;
-      f.y += Math.sin(f.heading) * f.speed * dt;
+
+      // magnetic pull toward the primary
+      var range = body.r * CAPTURE_RANGE + f.r;
+      if (!splat.active && dist < range) {
+        var prox = 1 - dist / range;
+        var acc = PULL_ACCEL * (0.15 + 0.85 * prox * prox);
+        f.pvx += ux * acc * dt; f.pvy += uy * acc * dt;
+        // let the pull win over its own wandering
+        f.heading = wrapAngle(f.heading + wrapAngle(Math.atan2(uy, ux) - f.heading) * Math.min(1, 3 * dt * prox));
+      } else {
+        f.pvx *= Math.exp(-4 * dt); f.pvy *= Math.exp(-4 * dt);
+      }
+      var ps = Math.sqrt(f.pvx * f.pvx + f.pvy * f.pvy);
+      if (ps > PULL_MAX) { f.pvx *= PULL_MAX / ps; f.pvy *= PULL_MAX / ps; ps = PULL_MAX; }
+      f.tug = ps / PULL_MAX; f.tugX = ux; f.tugY = uy;
+
+      f.x += (Math.cos(f.heading) * f.speed + f.pvx) * dt;
+      f.y += (Math.sin(f.heading) * f.speed + f.pvy) * dt;
       f.r = R * f.rf;
       bounceWalls(f, FRAG_SPEED_MAX);
 
       if (!splat.active) {
-        var dx = f.x - body.x, dy = f.y - body.y;
-        var touch = body.r + f.r * 0.75;
+        dx = body.x - f.x; dy = body.y - f.y;
+        var touch = body.r + f.r * 1.3;
         if (dx * dx + dy * dy < touch * touch) startMerge(f);
       }
     }
@@ -481,6 +614,8 @@
         f.r = R * f.rf;
       }
       if (splat.t >= BURST_TIME) endSplat();
+    } else if (tilt.enabled) {
+      moveMarble(dt);
     } else {
       moveBody(dt);
     }
@@ -680,18 +815,21 @@
     return c.getContext('2d');
   }
 
-  // gooey metaball pass used while the blob is tearing apart:
-  // the (shrinking) primary and the outgoing pieces are rendered as one merged surface
+  // gooey metaball pass: the primary plus any pieces tearing off or sinking in are
+  // rendered as one merged surface so necks form and close between them
   function drawGoo() {
     var items = [body], i, pc;
-    for (i = 0; i < frags.length; i++) if (frags[i].state === 'burst') items.push(frags[i]);
+    for (i = 0; i < frags.length; i++) {
+      if (frags[i].state === 'burst' || frags[i].state === 'merging') items.push(frags[i]);
+    }
 
-    var gR = splat.gooR, pad = gR * 0.6;
+    var gR = splat.active ? splat.gooR : body.r, pad = gR * 0.6;
     var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
     for (i = 0; i < items.length; i++) {
       pc = items[i];
-      minX = Math.min(minX, pc.x - pc.r); maxX = Math.max(maxX, pc.x + pc.r);
-      minY = Math.min(minY, pc.y - pc.r); maxY = Math.max(maxY, pc.y + pc.r);
+      var ext = pc.r * 2.3;   // room for stretch / teardrop / squash
+      minX = Math.min(minX, pc.x - ext); maxX = Math.max(maxX, pc.x + ext);
+      minY = Math.min(minY, pc.y - ext); maxY = Math.max(maxY, pc.y + ext);
     }
     var ox = Math.floor(minX - pad), oy = Math.floor(minY - pad);
     var w = Math.ceil(maxX + pad) - ox, h = Math.ceil(maxY + pad) - oy;
@@ -704,15 +842,9 @@
     sc.fillStyle = '#000';
     for (i = 0; i < items.length; i++) {
       pc = items[i];
-      sc.beginPath();
-      var steps = 28;
-      for (var k = 0; k <= steps; k++) {
-        var th = (k / steps) * Math.PI * 2;
-        var rr = pc.r * (1 + 0.09 * Math.sin(3 * th + time * 6 + pc.wob) + 0.05 * Math.sin(5 * th - time * 8));
-        var px = pc.x + Math.cos(th) * rr, py = pc.y + Math.sin(th) * rr;
-        if (k === 0) sc.moveTo(px, py); else sc.lineTo(px, py);
-      }
-      sc.closePath(); sc.fill();
+      if (pc.r < 0.5) continue;
+      tracePath(sc, pc);   // same outline (wobble, jiggle, squash, teardrop) as the normal renderer
+      sc.fill();
     }
     if (canFilter) sc.filter = 'none';
 
@@ -749,9 +881,9 @@
       pc = items[i];
       for (var gi = 0; gi < pc.galaxies.length; gi++) {
         var g = pc.galaxies[gi];
-        var a2 = pc.heading + g.ang;
-        var gx = pc.x + Math.cos(a2) * g.dist * pc.r, gy = pc.y + Math.sin(a2) * g.dist * pc.r;
-        var gr = pc.r * g.size * 0.8;
+        ballPoint(pc, g.ang, g.dist, tmp);
+        var gx = tmp.x, gy = tmp.y;
+        var gr = pc.r * g.size;
         var pulse = 0.75 + 0.25 * Math.sin(time * 1.3 + g.phase);
         var gg = bc.createRadialGradient(gx, gy, 0, gx, gy, gr);
         gg.addColorStop(0, g.color + (0.95 * pulse) + ')');
@@ -759,6 +891,23 @@
         gg.addColorStop(1, g.color + '0)');
         bc.fillStyle = gg;
         bc.beginPath(); bc.arc(gx, gy, gr, 0, Math.PI * 2); bc.fill();
+
+        bc.save();
+        bc.translate(gx, gy);
+        bc.rotate(time * g.spin + g.phase);
+        bc.strokeStyle = 'rgba(245,208,254,' + (0.35 * pulse) + ')';
+        bc.lineWidth = Math.max(0.6, gr * 0.06);
+        bc.beginPath();
+        for (var arm = 0; arm < 2; arm++) {
+          var a0 = arm * Math.PI;
+          bc.moveTo(0, 0);
+          for (var sp2 = 0; sp2 <= 1; sp2 += 0.08) {
+            var aa = a0 + sp2 * Math.PI * 1.6, ar = gr * 0.9 * sp2;
+            bc.lineTo(Math.cos(aa) * ar, Math.sin(aa) * ar * 0.55);
+          }
+        }
+        bc.stroke();
+        bc.restore();
       }
     }
     bc.globalCompositeOperation = 'lighter';
@@ -766,21 +915,27 @@
       pc = items[i];
       for (var si = 0; si < pc.stars.length; si++) {
         var st = pc.stars[si];
-        var a3 = pc.heading + st.ang;
-        var sx = pc.x + Math.cos(a3) * st.dist * pc.r, sy = pc.y + Math.sin(a3) * st.dist * pc.r;
+        ballPoint(pc, st.ang, st.dist, tmp);
         var al = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * st.twSpeed + st.tw));
         bc.fillStyle = 'rgba(255,255,255,' + al + ')';
-        bc.beginPath(); bc.arc(sx, sy, st.size, 0, Math.PI * 2); bc.fill();
+        bc.beginPath(); bc.arc(tmp.x, tmp.y, st.size, 0, Math.PI * 2); bc.fill();
       }
     }
 
     bc.globalCompositeOperation = 'screen';
     bc.lineCap = 'round';
     bc.strokeStyle = 'rgba(255,255,255,0.7)';
-    bc.lineWidth = Math.max(0.8, gR * 0.03);
     for (i = 0; i < items.length; i++) {
       pc = items[i];
-      bc.beginPath(); bc.arc(pc.x, pc.y, pc.r * 0.72, -2.4, -1.5); bc.stroke();
+      if (pc.r < 0.5) continue;
+      bc.lineWidth = Math.max(0.8, pc.r * 0.035);
+      bc.beginPath();
+      for (var hk = 0; hk <= 8; hk++) {
+        var hth = -2.5 + (1.0 * hk / 8);
+        deform(pc, pc.x + Math.cos(hth) * pc.r * 0.78, pc.y + Math.sin(hth) * pc.r * 0.78, tmp2);
+        if (hk === 0) bc.moveTo(tmp2.x, tmp2.y); else bc.lineTo(tmp2.x, tmp2.y);
+      }
+      bc.stroke();
     }
     bc.globalCompositeOperation = 'destination-in';
     bc.setTransform(1, 0, 0, 1, 0, 0);
@@ -802,11 +957,12 @@
   function draw() {
     ctx.clearRect(0, 0, W, H);
     drawDrips();
-    // drifting / merging fragments sit behind the primary blob
-    for (var i = 0; i < frags.length; i++) {
-      if (frags[i].state !== 'burst') drawBlob(frags[i]);
+    var goo = splat.active, i;
+    for (i = 0; i < frags.length; i++) {
+      if (frags[i].state === 'merging') goo = true;
+      else if (frags[i].state === 'free') drawBlob(frags[i]);   // drifting fragments sit behind the primary
     }
-    if (splat.active) drawGoo(); else drawBlob(body);
+    if (goo) drawGoo(); else drawBlob(body);
   }
 
   function frame(now) {
