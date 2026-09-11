@@ -106,58 +106,9 @@
 
   var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
 
-  // ---- audio ----
-  // Preferred path: Web Audio. Both clips are fetched and decoded into memory once, so a tap
-  // triggers playback with no load/decode latency. Fallback: pre-loaded <audio> elements.
-  var AudioCtx = window.AudioContext || window.webkitAudioContext;
-  var actx = null, buffers = { splat: null, complete: null };
-  var splatPool = [], splatPoolIdx = 0, completeSound = null;
-
-  function loadBuffer(url, key) {
-    if (!actx || typeof fetch !== 'function') return;
-    fetch(url).then(function (r) {
-      if (!r.ok) throw new Error(url);
-      return r.arrayBuffer();
-    }).then(function (data) {
-      return new Promise(function (res, rej) {
-        var p = actx.decodeAudioData(data, res, rej);   // old Safari: callbacks only
-        if (p && p.then) p.then(res, rej);
-      });
-    }).then(function (buf) { buffers[key] = buf; }).catch(function () {});
-  }
-
-  try {
-    if (AudioCtx) {
-      actx = new AudioCtx();
-      loadBuffer(SOUND_SRC, 'splat');
-      loadBuffer(COMPLETE_SOUND_SRC, 'complete');
-    }
-  } catch (e) { actx = null; }
-
-  try {
-    for (var ai = 0; ai < 3; ai++) {
-      var a = new Audio(SOUND_SRC); a.preload = 'auto'; a.load(); splatPool.push(a);
-    }
-    completeSound = new Audio(COMPLETE_SOUND_SRC); completeSound.preload = 'auto'; completeSound.load();
-  } catch (e) { splatPool = []; completeSound = null; }
-
-  // must run inside a user gesture on mobile: wakes the Web Audio context
-  function unlockAudio() {
-    if (actx && actx.state !== 'running') {
-      try { var p = actx.resume(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
-    }
-  }
-
-  function playBuffer(key) {
-    if (!actx || !buffers[key]) return false;
-    try {
-      var src = actx.createBufferSource();
-      src.buffer = buffers[key];
-      src.connect(actx.destination);
-      src.start(0);          // if the context is still resuming, this is queued and plays the instant it runs
-      return true;
-    } catch (e) { return false; }
-  }
+  var splatSound = null, completeSound = null;
+  try { splatSound = new Audio(SOUND_SRC); splatSound.preload = 'auto'; } catch (e) { splatSound = null; }
+  try { completeSound = new Audio(COMPLETE_SOUND_SRC); completeSound.preload = 'auto'; } catch (e) { completeSound = null; }
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
@@ -181,12 +132,10 @@
   }
 
   function playSplat() {
-    if (playBuffer('splat')) return;
-    if (!splatPool.length) return;
+    if (!splatSound) return;
     try {
-      var a = splatPool[splatPoolIdx]; splatPoolIdx = (splatPoolIdx + 1) % splatPool.length;   // pool so rapid re-splats overlap
-      a.currentTime = 0;
-      var p = a.play();
+      var s = splatSound.cloneNode();       // clone so rapid re-splats can overlap
+      var p = s.play();
       if (p && p.catch) p.catch(function () {});
     } catch (e) {}
   }
@@ -206,7 +155,6 @@
   }
 
   function playComplete() {
-    if (playBuffer('complete')) return;
     if (!completeSound) return;
     try {
       completeSound.currentTime = 0;
@@ -379,7 +327,6 @@
     var K = MAX_PIECES - frags.length;
     var A = body.rf * body.rf, keepA = KEEP_AREA, restA = A - keepA;
     if (K <= 0 || restA < 1e-4) { wobble(cx, cy); return false; }
-    playSplat();   // first, so the sound isn't waiting on the geometry below
     var wts = [], sum = 0;
     for (var i = 0; i < K; i++) { var w = rand(0.7, 1.3); wts.push(w); sum += w; }
 
@@ -420,6 +367,7 @@
     splat.rfTo = Math.sqrt(keepA);
     splat.gooR = r0;
     body.speed = 0;
+    playSplat();
     return true;
   }
 
@@ -554,7 +502,6 @@
   }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
-    unlockAudio();
     primeAudio();
     flushPendingAudio();
     var pt = pointerPos(e);
