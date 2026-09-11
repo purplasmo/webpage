@@ -140,13 +140,33 @@
     } catch (e) {}
   }
 
+  // Mobile browsers only let an audio element play if it was started inside a user gesture at least once.
+  // The completion sound is triggered by the animation, not a tap, so unlock it on the first tap.
+  var audioPrimed = false, completePending = false;
+  function primeAudio() {
+    if (audioPrimed || !completeSound) return;
+    audioPrimed = true;
+    try {
+      var p = completeSound.play();
+      if (p && p.catch) p.catch(function () {});
+      completeSound.pause();
+      completeSound.currentTime = 0;
+    } catch (e) {}
+  }
+
   function playComplete() {
     if (!completeSound) return;
     try {
       completeSound.currentTime = 0;
       var p = completeSound.play();
-      if (p && p.catch) p.catch(function () {});
-    } catch (e) {}
+      if (p && p.catch) p.catch(function () { completePending = true; });   // blocked: retry on the next tap
+    } catch (e) { completePending = true; }
+  }
+
+  function flushPendingAudio() {
+    if (!completePending) return;
+    completePending = false;
+    playComplete();
   }
 
   function syncRadius(b) { b.r = R * b.rf; }
@@ -482,6 +502,8 @@
   }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
+    primeAudio();
+    flushPendingAudio();
     var pt = pointerPos(e);
     if (splat.active || !insideBall(body, pt.x, pt.y)) return;
     if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
