@@ -75,12 +75,11 @@
   var FRAG_WANDER = 0.7;       // how much fragments meander (rad/s of heading noise)
   var HUNT_CHANCE = 0.6;       // chance the primary blob chases a fragment when it picks a new target
   var SOUND_SRC = 'splat.mp3';
-  var COMPLETE_SOUND_SRC = 'purplasmo.mp3';   // plays when the last fragment is absorbed
 
   // marble mode (phones/tablets with a motion sensor)
-  var MARBLE_ACCEL = 1100;     // px/s^2 at a full 90 degree tilt
-  var MARBLE_MAX_SPEED = 600;  // px/s
-  var MARBLE_FRICTION = 0.7;   // rolling drag (1/s)
+  var MARBLE_ACCEL = 1900;     // px/s^2 at a full 90 degree tilt
+  var MARBLE_MAX_SPEED = 950;  // px/s
+  var MARBLE_FRICTION = 0.45;  // rolling drag (1/s)
   var MARBLE_BOUNCE = 0.55;    // wall restitution
   var TILT_DEADZONE = 0.03;    // ignore sensor noise below this (fraction of g)
   var TILT_SMOOTH = 12;        // low-pass rate for the tilt reading
@@ -106,9 +105,8 @@
 
   var tmp = { x: 0, y: 0 }, tmp2 = { x: 0, y: 0 };
 
-  var splatSound = null, completeSound = null;
+  var splatSound = null;
   try { splatSound = new Audio(SOUND_SRC); splatSound.preload = 'auto'; } catch (e) { splatSound = null; }
-  try { completeSound = new Audio(COMPLETE_SOUND_SRC); completeSound.preload = 'auto'; } catch (e) { completeSound = null; }
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
@@ -138,35 +136,6 @@
       var p = s.play();
       if (p && p.catch) p.catch(function () {});
     } catch (e) {}
-  }
-
-  // Mobile browsers only let an audio element play if it was started inside a user gesture at least once.
-  // The completion sound is triggered by the animation, not a tap, so unlock it on the first tap.
-  var audioPrimed = false, completePending = false;
-  function primeAudio() {
-    if (audioPrimed || !completeSound) return;
-    audioPrimed = true;
-    try {
-      var p = completeSound.play();
-      if (p && p.catch) p.catch(function () {});
-      completeSound.pause();
-      completeSound.currentTime = 0;
-    } catch (e) {}
-  }
-
-  function playComplete() {
-    if (!completeSound) return;
-    try {
-      completeSound.currentTime = 0;
-      var p = completeSound.play();
-      if (p && p.catch) p.catch(function () { completePending = true; });   // blocked: retry on the next tap
-    } catch (e) { completePending = true; }
-  }
-
-  function flushPendingAudio() {
-    if (!completePending) return;
-    completePending = false;
-    playComplete();
   }
 
   function syncRadius(b) { b.r = R * b.rf; }
@@ -423,12 +392,6 @@
     // swallow ripple
     body.jiggle.t = 0; body.jiggle.amp = 0.09; body.jiggle.phase = f.entryAng;
     if (typeof gtag === 'function') gtag('event', 'blob_absorb', { remaining: frags.length });
-    if (!frags.length) {
-      // whole again
-      body.jiggle.amp = 0.14;
-      playComplete();
-      if (typeof gtag === 'function') gtag('event', 'blob_complete');
-    }
   }
 
   // ---- fragments combining with each other ----
@@ -502,8 +465,6 @@
   }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
-    primeAudio();
-    flushPendingAudio();
     var pt = pointerPos(e);
     if (splat.active || !insideBall(body, pt.x, pt.y)) return;
     if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
