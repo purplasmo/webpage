@@ -85,6 +85,12 @@
   var TILT_DEADZONE = 0.03;    // ignore sensor noise below this (fraction of g)
   var TILT_SMOOTH = 12;        // low-pass rate for the tilt reading
 
+  // follow mode (desktop: after a burst the primary chases the mouse cursor until it is whole again)
+  var FOLLOW_SPRING = 20;      // spring stiffness toward the cursor (1/s^2); lower = lazier trailing
+  var FOLLOW_DAMP = 8;         // velocity damping (1/s); slightly under critical so it overshoots a touch
+  var FOLLOW_MAX_SPEED = 800;  // px/s
+  var FOLLOW_BOUNCE = 0.35;    // wall restitution when the cursor drags it into an edge
+
   var R = BASE_R;              // full-size radius (screen scaled); every blob stores rf = radius / R
   var time = 0, last = performance.now();
   var target = { x: 0, y: 0, frag: null };  // frag: fragment being chased, if any
@@ -99,6 +105,13 @@
   // tilt: raw = latest sensor reading mapped to screen axes (fraction of g), x/y = smoothed
   var tilt = { enabled: false, rawX: 0, rawY: 0, x: 0, y: 0 };
   body.vx = 0; body.vy = 0;
+
+  // mouse: desktop = a fine pointer with hover (or we've seen a real mouse/pen event); active = cursor is over the page
+  var mouse = {
+    desktop: !!(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches),
+    active: false, x: 0, y: 0
+  };
+  var following = false;   // true while the primary is being steered by the cursor
 
   var gooSrc = document.createElement('canvas'), gooRim = document.createElement('canvas'),
       gooMask = document.createElement('canvas'), gooBody = document.createElement('canvas');
@@ -500,20 +513,33 @@
     var rect = canvas.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
+  function trackMouse(e, pt) {
+    // touch never steers; a real mouse or pen does (and proves this is a desktop-style device)
+    if (e.pointerType === 'touch') return;
+    if (e.pointerType === 'mouse' || e.pointerType === 'pen') mouse.desktop = true;
+    mouse.x = pt.x; mouse.y = pt.y;
+    mouse.active = true;
+  }
   var splatCount = 0;
   canvas.addEventListener('pointerdown', function (e) {
     primeAudio();
     flushPendingAudio();
     var pt = pointerPos(e);
+    trackMouse(e, pt);
     if (splat.active || !insideBall(body, pt.x, pt.y)) return;
     if (!startSplat(pt.x, pt.y)) return;   // nothing to release yet: it just wobbles
     splatCount++;
-    if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount, fragments: frags.length });
+    if (typeof gtag === 'function') gtag('event', 'blob_splat', { splat_count: splatCount, fragments: frags.length, mode: mouse.desktop && !tilt.enabled ? 'follow' : (tilt.enabled ? 'tilt' : 'wander') });
   });
   canvas.addEventListener('pointermove', function (e) {
     var pt = pointerPos(e);
+    trackMouse(e, pt);
     canvas.style.cursor = (!splat.active && insideBall(body, pt.x, pt.y)) ? 'pointer' : 'default';
   });
+  // cursor gone (left the window, tab hidden): the primary goes back to hunting on its own until it returns
+  canvas.addEventListener('pointerleave', function (e) { if (e.pointerType !== 'touch') mouse.active = false; });
+  window.addEventListener('blur', function () { mouse.active = false; });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) mouse.active = false; });
 
   // ---- tilt / accelerometer ----
   function screenAngle() {
@@ -615,27 +641,66 @@
     body.x += body.vx * dt;
     body.y += body.vy * dt;
 
-    // walls: bounce the velocity and squash on impact
-    var r = body.r, hit = false, nx = 0, ny = 0, impact = 0;
-    if (body.x < r) { body.x = r; if (body.vx < 0) { impact = -body.vx; body.vx = -body.vx * MARBLE_BOUNCE; hit = true; nx = 1; } }
-    if (body.x > W - r) { body.x = W - r; if (body.vx > 0) { impact = body.vx; body.vx = -body.vx * MARBLE_BOUNCE; hit = true; nx = -1; } }
-    if (body.y < r) { body.y = r; if (body.vy < 0) { impact = Math.max(impact, -body.vy); body.vy = -body.vy * MARBLE_BOUNCE; hit = true; ny = 1; } }
-    if (body.y > H - r) { body.y = H - r; if (body.vy > 0) { impact = Math.max(impact, body.vy); body.vy = -body.vy * MARBLE_BOUNCE; hit = true; ny = -1; } }
-    if (hit && impact > 40 && body.squash.cooldown <= 0) {
-      var nl = Math.sqrt(nx * nx + ny * ny) || 1;
-      body.squash.nx = nx / nl; body.squash.ny = ny / nl;
-      body.squash.t = 0;
-      body.squash.cooldown = 0.25;
-      var str = Math.min(1, impact / MARBLE_MAX_SPEED);
-      body.jiggle.t = 0;
-      body.jiggle.amp = 0.04 + 0.1 * str;
-      body.jiggle.phase = Math.atan2(body.squash.ny, body.squash.nx);
-      if (impact > 120) splash(body.x - body.squash.nx * r, body.y - body.squash.ny * r, body.squash.nx, body.squash.ny, r);
-    }
+    bounceVelocity(body, MARBLE_BOUNCE, MARBLE_MAX_SPEED);
 
     sp = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
     body.speed = sp;
     if (sp > 4) body.heading = Math.atan2(body.vy, body.vx);
+  }
+
+  // walls for velocity-driven movers (marble / follow): bounce the velocity and squash on impact
+  function bounceVelocity(b, bounce, maxSpeed) {
+    var r = b.r, hit = false, nx = 0, ny = 0, impact = 0;
+    if (b.x < r) { b.x = r; if (b.vx < 0) { impact = -b.vx; b.vx = -b.vx * bounce; hit = true; nx = 1; } }
+    if (b.x > W - r) { b.x = W - r; if (b.vx > 0) { impact = b.vx; b.vx = -b.vx * bounce; hit = true; nx = -1; } }
+    if (b.y < r) { b.y = r; if (b.vy < 0) { impact = Math.max(impact, -b.vy); b.vy = -b.vy * bounce; hit = true; ny = 1; } }
+    if (b.y > H - r) { b.y = H - r; if (b.vy > 0) { impact = Math.max(impact, b.vy); b.vy = -b.vy * bounce; hit = true; ny = -1; } }
+    if (hit && impact > 40 && b.squash.cooldown <= 0) {
+      var nl = Math.sqrt(nx * nx + ny * ny) || 1;
+      b.squash.nx = nx / nl; b.squash.ny = ny / nl;
+      b.squash.t = 0;
+      b.squash.cooldown = 0.25;
+      var str = Math.min(1, impact / maxSpeed);
+      b.jiggle.t = 0;
+      b.jiggle.amp = 0.04 + 0.1 * str;
+      b.jiggle.phase = Math.atan2(b.squash.ny, b.squash.nx);
+      if (impact > 120) splash(b.x - b.squash.nx * r, b.y - b.squash.ny * r, b.squash.nx, b.squash.ny, r);
+    }
+    return hit;
+  }
+
+  // desktop follow mode: a damped spring drags the primary to the cursor so the player can scoop up fragments
+  function shouldFollow() {
+    return mouse.desktop && !tilt.enabled && mouse.active && frags.length > 0;
+  }
+
+  function moveFollow(dt) {
+    var dx = mouse.x - body.x, dy = mouse.y - body.y;
+    body.vx += (dx * FOLLOW_SPRING - body.vx * FOLLOW_DAMP) * dt;
+    body.vy += (dy * FOLLOW_SPRING - body.vy * FOLLOW_DAMP) * dt;
+    var sp = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+    if (sp > FOLLOW_MAX_SPEED) { body.vx *= FOLLOW_MAX_SPEED / sp; body.vy *= FOLLOW_MAX_SPEED / sp; sp = FOLLOW_MAX_SPEED; }
+    body.x += body.vx * dt;
+    body.y += body.vy * dt;
+
+    bounceVelocity(body, FOLLOW_BOUNCE, FOLLOW_MAX_SPEED);
+
+    sp = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+    body.speed = sp;
+    if (sp > 4) body.heading = Math.atan2(body.vy, body.vx);
+  }
+
+  // hand-offs between cursor steering and free wandering
+  function enterFollow() {
+    following = true;
+    body.vx = Math.cos(body.heading) * body.speed;   // carry current motion into the spring
+    body.vy = Math.sin(body.heading) * body.speed;
+  }
+  function exitFollow() {
+    following = false;
+    body.speed = Math.min(SPEED_MAX, body.speed);    // wander mode's speed cap
+    body.vx = 0; body.vy = 0;
+    pickTarget();
   }
 
   // ---- simulation ----
@@ -816,7 +881,11 @@
       if (splat.t >= BURST_TIME) endSplat();
     } else if (tilt.enabled) {
       moveMarble(dt);
+    } else if (shouldFollow()) {
+      if (!following) enterFollow();
+      moveFollow(dt);
     } else {
+      if (following) exitFollow();   // whole again (or cursor left): back to wandering
       moveBody(dt);
     }
 
